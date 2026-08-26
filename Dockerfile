@@ -8,8 +8,9 @@
 #
 # The kernel wireguard module lives on the HOST; the container only programs
 # it, hence NET_ADMIN + host networking. With host networking, iptables calls
-# inside the container program the HOST's firewall tables. ip_forward is set
-# via --sysctl (docker allowlists it); /proc/sys itself is read-only here.
+# inside the container program the HOST's firewall tables. ip_forward must be
+# enabled on the HOST once (docker rejects --sysctl under host networking);
+# the router degrades to a warning if iptables/forwarding are unavailable.
 FROM --platform=$BUILDPLATFORM golang:1.25 AS build
 ARG TARGETOS
 ARG TARGETARCH
