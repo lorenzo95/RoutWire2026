@@ -65,6 +65,7 @@ func main() {
 		installF   = flag.Bool("install", false, "with -service: install and start the system service")
 		uninstallF = flag.Bool("uninstall", false, "with -service: stop and remove the system service")
 		systemF    = flag.String("system", "", `with -service: init system: auto (default), systemd, sysvinit`)
+		insecureF  = flag.Bool("dht-insecure", false, "skip TLS verification for DHT proxies (for HTTPS-intercepting networks; payloads stay end-to-end encrypted)")
 
 		remoteF = flag.String("remote", "", "remote device name (for -export / -remove)")
 		outF    = flag.String("out", "", "write exported config to file (0600) instead of stdout")
@@ -176,7 +177,7 @@ run 'meshd -h' for every flag and subcommand.
 		return
 	}
 
-	store := newStore(resolved.Backend, strings.Join(resolved.Proxies, ","))
+	store := newStore(resolved.Backend, strings.Join(resolved.Proxies, ","), *insecureF)
 
 	spokesPath := ""
 	if *configF != "" {
@@ -223,7 +224,11 @@ run 'meshd -h' for every flag and subcommand.
 			fatalf("device: %v", err)
 		}
 		rtr, err := mesh.NewLinuxRouter(resolved.IFace, resolved.Port)
-		if err != nil {
+		switch {
+		case errors.Is(err, mesh.ErrNoIptables):
+			logger.Printf("warning: %v — port/forwarding/NAT management disabled; handle on the host", err)
+			rtr = nil
+		case err != nil:
 			ld.Close()
 			fatalf("router: %v", err)
 		}
@@ -591,7 +596,7 @@ func renderConfigYAML(rc *config.MeshConfig) []byte {
 	return []byte(b.String())
 }
 
-func newStore(backend, proxyOverride string) *engine.ReliableStore {
+func newStore(backend, proxyOverride string, insecureTLS bool) *engine.ReliableStore {
 	switch backend {
 	case "mock":
 		return engine.NewReliable(engine.NewMockStore(10*time.Minute, time.Now))
@@ -605,7 +610,7 @@ func newStore(backend, proxyOverride string) *engine.ReliableStore {
 				}
 			}
 		}
-		return engine.NewReliable(engine.NewOpenDHT(endpoints))
+		return engine.NewReliable(engine.NewOpenDHT(endpoints, engine.WithInsecureTLS(insecureTLS)))
 	default:
 		fatalf("unknown backend %q (opendht|mock)", backend)
 		return nil

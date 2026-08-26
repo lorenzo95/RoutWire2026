@@ -42,6 +42,7 @@ type Daemon struct {
 	router   Router
 	spokeSrc map[string]net.IP
 	spokes   map[string]bool
+	fwdWarned bool
 	log      *log.Logger
 	seq      uint64
 	lastGood map[string]Candidate
@@ -318,6 +319,12 @@ func (dm *Daemon) spokeEvictAfter() time.Duration {
 // syncNat keeps masquerade rules in step with the spoke set: our spokes get a
 // source-NAT rule so the mesh can reply to them; departed spokes are removed.
 func (dm *Daemon) syncNat() {
+	if !dm.fwdWarned {
+		if err := dm.router.Forwarding(); err != nil {
+			dm.log.Printf("router: enable forwarding: %v (spoke NAT needs it; containers: --sysctl net.ipv4.ip_forward=1)", err)
+		}
+		dm.fwdWarned = true
+	}
 	want := make(map[string]net.IP)
 	for name := range dm.spokes {
 		if ip, err := dm.d.OverlayIP(name, dm.cfg.CIDR); err == nil {

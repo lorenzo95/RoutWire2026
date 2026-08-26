@@ -1,6 +1,7 @@
 package mesh
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -8,6 +9,11 @@ import (
 	"strings"
 	"sync"
 )
+
+// ErrNoIptables is returned by NewLinuxRouter when the iptables binary is
+// unavailable (e.g. minimal containers). Callers may fall back to a no-op
+// router and manage firewall/forwarding on the host themselves.
+var ErrNoIptables = errors.New("iptables executable not found")
 
 // Router integrates the daemon with kernel routing + firewall state that a
 // mesh node needs beyond the WireGuard interface itself:
@@ -61,6 +67,9 @@ func NewLinuxRouter(iface string, port int) (Router, error) {
 	if err != nil {
 		return nil, fmt.Errorf("router: read ip_forward: %w", err)
 	}
+	if _, err := exec.LookPath("iptables"); err != nil {
+		return noopRouter{}, fmt.Errorf("%w", ErrNoIptables)
+	}
 	r := &linuxRouter{
 		iface:    iface,
 		port:     port,
@@ -100,9 +109,11 @@ func (r *linuxRouter) AddSource(spoke net.IP) error {
 	if ip4 == nil {
 		return fmt.Errorf("router: %s is not IPv4", spoke)
 	}
-	if err := r.Forwarding(); err != nil {
-		return err
-	}
+	// Best-effort: forwarding may be preset outside our control (e.g.
+	// `docker run --sysctl net.ipv4.ip_forward=1`); don't fail the NAT rule
+	// for it — the masquerade itself is what we own. Callers warn separately
+	// if Forwarding() keeps failing.
+	_ = r.Forwarding()
 	src := ip4.String() + "/32"
 
 	r.mu.Lock()

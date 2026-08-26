@@ -26,10 +26,11 @@ import (
 //
 // Only 40-hex InfoHash keys are valid (roomKeyID already produces those).
 type OpenDHT struct {
-	base    []string
-	magic   string
-	client  *http.Client
-	timeout time.Duration
+	base        []string
+	magic       string
+	client      *http.Client
+	timeout     time.Duration
+	insecureTLS bool
 }
 
 var _ Store = (*OpenDHT)(nil)
@@ -46,13 +47,27 @@ func NewOpenDHT(endpoints []string, opts ...OpenDHTOption) *OpenDHT {
 	for _, opt := range opts {
 		opt(o)
 	}
-	o.client = &http.Client{Timeout: o.timeout}
+	o.client = &http.Client{Timeout: o.timeout, Transport: o.transport()}
 	return o
+}
+
+// transport builds the HTTP transport; insecure skips TLS verification for
+// networks that intercept HTTPS. Safe-ish here: every value we store or read
+// is already end-to-end sealed and signed at the application layer.
+func (o *OpenDHT) transport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	if o.insecureTLS {
+		t.TLSClientConfig.InsecureSkipVerify = true
+	}
+	return t
 }
 
 type OpenDHTOption func(*OpenDHT)
 
 func WithMagic(m string) OpenDHTOption { return func(o *OpenDHT) { o.magic = m } }
+
+// WithInsecureTLS disables certificate verification on the proxy transport.
+func WithInsecureTLS(v bool) OpenDHTOption { return func(o *OpenDHT) { o.insecureTLS = v } }
 func WithTimeTo(d time.Duration) OpenDHTOption {
 	return func(o *OpenDHT) { o.timeout = d }
 }
