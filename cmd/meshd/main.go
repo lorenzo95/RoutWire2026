@@ -276,7 +276,7 @@ run 'meshd -h' for every flag and subcommand.
 	logger.Printf("public-key=%s", pubKey)
 
 	if err := daemon.Setup(); err != nil {
-		fatalf("setup: %v", err)
+		fatalf("setup: %v%s", err, setupHint(err))
 	}
 
 	done := make(chan struct{})
@@ -615,6 +615,21 @@ func newStore(backend, proxyOverride string, insecureTLS bool) *engine.ReliableS
 		fatalf("unknown backend %q (opendht|mock)", backend)
 		return nil
 	}
+}
+
+// setupHint turns common interface-creation failures into actionable advice.
+func setupHint(err error) string {
+	var hint string
+	switch {
+	case errors.Is(err, syscall.EOPNOTSUPP), strings.Contains(strings.ToLower(err.Error()), "not supported"):
+		hint = "\n  the kernel has no WireGuard support: needs Linux >= 5.6, or the\n" +
+			"  wireguard module/dkms package for this kernel (try: modprobe wireguard)"
+	case errors.Is(err, syscall.EPERM):
+		hint = "\n  missing privileges: run as root, or in containers add --cap-add=NET_ADMIN"
+	case errors.Is(err, syscall.EEXIST):
+		hint = "\n  leftover interface: sudo meshd stop (or: ip link del <iface>)"
+	}
+	return hint
 }
 
 func stopInterface(iface string) error {
