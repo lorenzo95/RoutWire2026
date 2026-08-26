@@ -91,13 +91,23 @@ func (r *linuxRouter) openPort() error {
 	return r.run("filter", "-I", "INPUT", "1", "-p", "udp", "--dport", fmt.Sprintf("%d", r.port), "-j", "ACCEPT")
 }
 
+// ipForwardPath is a package var so tests can point it at a temp file.
+var ipForwardPath = "/proc/sys/net/ipv4/ip_forward"
+
 func (r *linuxRouter) Forwarding() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.fwdSet {
 		return nil
 	}
-	if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0o644); err != nil {
+	// Already on? Common on Docker hosts (dockerd enables it globally for its
+	// own bridge NAT) — treat as satisfied instead of failing on their
+	// read-only /proc/sys mount.
+	if b, err := os.ReadFile(ipForwardPath); err == nil && strings.TrimSpace(string(b)) == "1" {
+		r.fwdSet = true
+		return nil
+	}
+	if err := os.WriteFile(ipForwardPath, []byte("1"), 0o644); err != nil {
 		return fmt.Errorf("router: enable ip_forward: %w", err)
 	}
 	r.fwdSet = true
