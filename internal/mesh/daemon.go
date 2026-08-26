@@ -321,7 +321,7 @@ func (dm *Daemon) spokeEvictAfter() time.Duration {
 func (dm *Daemon) syncNat() {
 	if !dm.fwdWarned {
 		if err := dm.router.Forwarding(); err != nil {
-			dm.log.Printf("router: enable forwarding: %v (spoke NAT needs it; containers: --sysctl net.ipv4.ip_forward=1)", err)
+			dm.log.Printf("router: enable forwarding: %v (spoke NAT needs it; enable net.ipv4.ip_forward=1 on the HOST — containers mount /proc/sys read-only)", err)
 		}
 		dm.fwdWarned = true
 	}
