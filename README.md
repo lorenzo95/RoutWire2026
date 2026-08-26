@@ -11,6 +11,27 @@ every other node by itself, over LAN, across NAT, IPv4 or IPv6.
 > **Status:** experimental. `meshd` creates real kernel interfaces, routes and
 > firewall rules. Run it on machines you own.
 
+## Install
+
+One-liner (Linux amd64/arm64/arm, verifies sha256, installs to `/usr/local/bin`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/lorenzo95/RoutWire2026/main/install.sh | sudo sh
+```
+
+Or grab a tarball directly from [Releases](https://github.com/lorenzo95/RoutWire2026/releases).
+
+Container (host kernel provides WireGuard; container programs it):
+
+```sh
+docker run -d --name meshd --restart unless-stopped \
+  --network=host --cap-add=NET_ADMIN \
+  -v /etc/meshd.yaml:/etc/meshd.yaml:ro \
+  ghcr.io/lorenzo95/routewire2026 [-config /etc/meshd.yaml]
+```
+
+Images are multi-arch (amd64/arm64): `ghcr.io/lorenzo95/routewire2026:<tag>` / `:latest`.
+
 ## How it works
 
 - **Everything is derived from PSK + name.** A node's WireGuard private key,
