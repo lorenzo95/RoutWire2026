@@ -15,6 +15,7 @@
 
 services:
   meshd:
+    build: .
     image: ghcr.io/lorenzo95/routewire2026:latest
     container_name: meshd
     restart: unless-stopped
