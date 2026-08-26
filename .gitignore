@@ -1,0 +1,11 @@
+# build output
+/meshd
+/meshd.test
+
+# runtime state & configs (contain PSKs)
+meshd.yaml
+*.yaml.spokes
+meshd.spokes
+
+# misc
+9324
