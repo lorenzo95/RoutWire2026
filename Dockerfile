@@ -2,7 +2,7 @@
 # Build:   docker build -t routewire/meshd .
 # Run:     docker run -d --name meshd --restart unless-stopped \
 #            --network=host --cap-add=NET_ADMIN \
-#            --sysctl net.ipv4.ip_forward=1 \
+#            (enable net.ipv4.ip_forward=1 on the HOST once) \
 #            -v /etc/meshd.yaml:/etc/meshd.yaml:ro \
 #            ghcr.io/lorenzo95/routewire2026 -config /etc/meshd.yaml
 #

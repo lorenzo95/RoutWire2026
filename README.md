@@ -24,17 +24,20 @@ Or grab a tarball directly from [Releases](https://github.com/lorenzo95/RoutWire
 Container (host kernel provides WireGuard; container programs it):
 
 ```sh
+sudo sysctl -w net.ipv4.ip_forward=1        # once per host (needed for spoke NAT)
+
 docker run -d --name meshd --restart unless-stopped \
   --network=host --cap-add=NET_ADMIN \
-  --sysctl net.ipv4.ip_forward=1 \
   -v /etc/meshd.yaml:/etc/meshd.yaml:ro \
   ghcr.io/lorenzo95/routewire2026 [-config /etc/meshd.yaml]
 ```
 
 Images are multi-arch (amd64/arm64): `ghcr.io/lorenzo95/routewire2026:<tag>` / `:latest`.
 With host networking the container's iptables calls program the **host** tables;
-`ip_forward` comes from `--sysctl`. On networks that intercept TLS add
-`-dht-insecure` (payloads remain end-to-end sealed+signed).
+`--sysctl` is not permitted under host networking, so set forwarding on the
+host as above (meshd degrades gracefully and warns if iptables/forwarding are
+unavailable). On networks that intercept TLS add `-dht-insecure` (payloads
+remain end-to-end sealed+signed).
 
 ## How it works
 
