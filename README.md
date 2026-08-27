@@ -22,18 +22,23 @@ curl -fsSL https://raw.githubusercontent.com/lorenzo95/RoutWire2026/main/install
 Or grab a tarball directly from [Releases](https://github.com/lorenzo95/RoutWire2026/releases).
 
 Container (the container shares the host kernel, which provides WireGuard, and
-programs it with host networking): first write a config, then run it:
+programs it with host networking): first write a config, then run it. Mount a
+`/etc/meshd` **directory** (a file mount would be created as a directory the
+first time, so the config can't be written into it):
 
 ```sh
-# 1) init — generate a config (writes to host /etc/meshd.yaml)
-docker run --rm --name meshd-init -v /etc/meshd.yaml:/etc/meshd.yaml \
-  ghcr.io/lorenzo95/routewire2026 init -name alpha -out /etc/meshd.yaml
+sudo mkdir -p /etc/meshd
+
+# 1) init — generate a config (writes /etc/meshd/meshd.yaml on the host)
+sudo docker run --rm --name meshd-init \
+  -v /etc/meshd:/etc/meshd \
+  ghcr.io/lorenzo95/routewire2026 init -name alpha -out /etc/meshd/meshd.yaml
 
 # 2) run — the daemon, restarted across reboots
-docker run -d --name meshd --restart unless-stopped \
+sudo docker run -d --name meshd --restart unless-stopped \
   --network=host --cap-add=NET_ADMIN \
-  -v /etc/meshd.yaml:/etc/meshd.yaml:ro \
-  ghcr.io/lorenzo95/routewire2026
+  -v /etc/meshd:/etc/meshd:ro \
+  ghcr.io/lorenzo95/routewire2026 -config /etc/meshd/meshd.yaml
 ```
 
 Images are multi-arch (amd64/arm64): `ghcr.io/lorenzo95/routewire2026:<tag>` / `:latest`.
@@ -48,9 +53,10 @@ add `-dht-insecure` (payloads remain end-to-end sealed+signed).
 Or use the shipped compose stack (`compose.yaml`):
 
 ```sh
-# 1) init — write /etc/meshd/meshd.yaml (+ PSK) via the one-shot helper
-sudo MESH_PSK='<psk>' docker compose run --rm meshd-init \
-     init -name alpha -out /etc/meshd/meshd.yaml
+# 1) init — write /etc/meshd/meshd.yaml (and generate the PSK) for the first node
+sudo docker compose run --rm meshd-init init -name alpha -out /etc/meshd/meshd.yaml
+
+# ...other nodes reuse that PSK: sudo MESH_PSK='<psk>' docker compose run ... init -name beta ...
 
 # 2) run — the daemon
 sudo docker compose up -d
