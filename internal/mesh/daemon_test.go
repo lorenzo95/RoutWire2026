@@ -305,3 +305,122 @@ func TestTickPreservesFreshObservedWinner(t *testing.T) {
 		t.Fatalf("fresh observed winner must be preserved (one idempotent apply), saw %d", dev.Applies()-applies)
 	}
 }
+
+func TestTickCreditsKernelEndpointAfterHandshake(t *testing.T) {
+	store := engine.NewReliable(engine.NewMockStore(10*time.Minute, time.Now))
+	dev := NewFakeDevice()
+	alpha, d := newTestDaemon(t, "alpha", store, dev)
+	betaPub := pubKeyOf(t, d, "beta")
+	dialed := "198.51.100.9:55555" // advertised candidate we dial
+	roamed := "198.51.100.9:60000" // where the peer actually is
+
+	publishBeta(t, alpha, d, []Candidate{srflxC(dialed)})
+	roamedEP, _ := net.ResolveUDPAddr("udp", roamed)
+	// The handshake completes because the peer's own traffic arrives — not
+	// because our dial worked — and WireGuard roams to the peer's true
+	// source. Simulate that roam at the moment traffic lands: write the
+	// observed map directly, since Traffic holds the fake's mutex (a
+	// re-entrant SetObserved here would deadlock) and the roam must be
+	// recorded before the handshake timestamp for determinism.
+	dev.Reachable = func(*net.UDPAddr) bool {
+		dev.observed[betaPub] = roamedEP
+		return true
+	}
+	alpha.probe = func(net.IP, int) { dev.Traffic(betaPub) }
+
+	ctx := context.Background()
+	if err := alpha.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	if err := alpha.Tick(ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if alpha.lastGood["beta"].Addr != roamed {
+		t.Fatalf("winner must be the kernel-roamed endpoint %s, got %+v", roamed, alpha.lastGood["beta"])
+	}
+}
+
+func TestTickAdoptsKernelEndpointForLiveSession(t *testing.T) {
+	store := engine.NewReliable(engine.NewMockStore(10*time.Minute, time.Now))
+	dev := NewFakeDevice()
+	alpha, d := newTestDaemon(t, "alpha", store, dev)
+	betaPub := pubKeyOf(t, d, "beta")
+	live := "198.51.100.9:60000"
+
+	publishBeta(t, alpha, d, []Candidate{srflxC("198.51.100.9:55555")})
+	liveEP, _ := net.ResolveUDPAddr("udp", live)
+	// A live session predates this process (daemon restart): the handshake is
+	// fresh and the kernel tracks the working endpoint, but lastGood is empty.
+	dev.SetHandshake(betaPub, time.Now())
+	dev.SetObserved(betaPub, liveEP)
+	// If meshd raced anyway, the probe would produce no handshake (nothing is
+	// Reachable) and it would exhaust — a second Apply per candidate. Adoption
+	// must skip racing entirely: exactly one (idempotent) Apply.
+	dev.Reachable = func(*net.UDPAddr) bool { return false }
+
+	ctx := context.Background()
+	if err := alpha.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	if err := alpha.Tick(ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if alpha.lastGood["beta"].Addr != live {
+		t.Fatalf("live session must adopt the kernel endpoint %s, got %+v", live, alpha.lastGood["beta"])
+	}
+	if dev.Applies() != 1 {
+		t.Fatalf("live session must not be re-raced (1 apply expected), saw %d", dev.Applies())
+	}
+}
+
+func TestOrderedForDedupesObservedByAddr(t *testing.T) {
+	store := engine.NewReliable(engine.NewMockStore(10*time.Minute, time.Now))
+	dev := NewFakeDevice()
+	alpha, d := newTestDaemon(t, "alpha", store, dev)
+	betaPub := pubKeyOf(t, d, "beta")
+	same := "198.51.100.9:55555" // observed == advertised
+
+	rec := &Record{Name: "beta", Candidates: []Candidate{srflxC(same)}}
+	mine := []Candidate{srflxC("203.0.113.7:40000")}
+	obsEP, _ := net.ResolveUDPAddr("udp", same)
+	dev.SetObserved(betaPub, obsEP)
+
+	order := alpha.orderedFor(betaPub, mine, rec)
+	count := 0
+	for _, c := range order {
+		if c.Addr == same {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("observed addr equal to advertised must be dialed once, got %d: %+v", count, order)
+	}
+}
+
+func TestOrderedForGatesPrivateObserved(t *testing.T) {
+	store := engine.NewReliable(engine.NewMockStore(10*time.Minute, time.Now))
+	dev := NewFakeDevice()
+	alpha, d := newTestDaemon(t, "alpha", store, dev)
+	betaPub := pubKeyOf(t, d, "beta")
+	privAddr := "192.168.1.50:51820"
+	priv, _ := net.ResolveUDPAddr("udp", privAddr)
+	mine := []Candidate{srflxC("203.0.113.7:40000")}
+
+	// Cross-site: a LAN observation from the peer's past visit must not be
+	// dialed — it addresses our own private space now.
+	cross := &Record{Name: "beta", Candidates: []Candidate{srflxC("198.51.100.9:55555")}}
+	dev.SetObserved(betaPub, priv)
+	order := alpha.orderedFor(betaPub, mine, cross)
+	for _, c := range order {
+		if c.Addr == privAddr {
+			t.Fatalf("private observed endpoint must be dropped across sites, got %+v", order)
+		}
+	}
+
+	// Shared edge: the LAN observation IS the fast path (vm1<->vm2 case).
+	shared := &Record{Name: "beta", Candidates: []Candidate{srflxC("203.0.113.7:55555")}}
+	order = alpha.orderedFor(betaPub, mine, shared)
+	if len(order) == 0 || order[0].Type != CandPRFLX || order[0].Addr != privAddr {
+		t.Fatalf("private observed endpoint must lead the race on a shared edge, got %+v", order)
+	}
+}

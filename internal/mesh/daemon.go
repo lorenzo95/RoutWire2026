@@ -226,7 +226,20 @@ func (dm *Daemon) Tick(ctx context.Context) error {
 
 	for i := range plans {
 		p := &plans[i]
-		if p.freshNow && p.haveWin {
+		if p.freshNow {
+			if !p.haveWin {
+				// A live session we can't account for (daemon restart, or
+				// the peer roamed in on its own): adopt the kernel's tracked
+				// endpoint as the winner instead of re-racing — racing a
+				// working session only churns endpoints and log noise.
+				if ep := dm.dev.Endpoint(p.pub); ep != nil && ep.IP != nil {
+					win := Candidate{Type: CandPRFLX, Addr: ep.String()}
+					dm.lastGood[p.name] = win
+					p.winner, p.haveWin = win, true
+					p.desire.Endpoint = ep
+					dm.log.Printf("peer %s: adopted live session via %s", p.name, win.Addr)
+				}
+			}
 			// A live, freshly-handshaken winner — even one observed from the
 			// peer's own traffic (not advertised) — is left undisturbed so we
 			// never flap back to a stale advertised candidate.
@@ -244,9 +257,19 @@ func (dm *Daemon) Tick(ctx context.Context) error {
 				break
 			}
 			if dm.tryConnect(p.pub, dm.overlayIPFor(p.name), p.rec.Port) {
-				dm.lastGood[p.name] = cand
-				p.winner, p.haveWin = cand, true
-				dm.log.Printf("peer %s: converged via %s %s", p.name, cand.Type, cand.Addr)
+				// The handshake proves reachability but not which dial caused
+				// it: the peer's own racing can complete one too, and
+				// WireGuard roams to the source of authenticated traffic. The
+				// kernel's current endpoint is the authoritative path —
+				// credit that when it disagrees with the dialed candidate.
+				win := cand
+				if ep := dm.dev.Endpoint(p.pub); ep != nil && ep.IP != nil && ep.String() != cand.Addr {
+					win = Candidate{Type: CandPRFLX, Addr: ep.String()}
+					p.desire.Endpoint = ep
+				}
+				dm.lastGood[p.name] = win
+				p.winner, p.haveWin = win, true
+				dm.log.Printf("peer %s: converged via %s %s", p.name, win.Type, win.Addr)
 				won = true
 				break
 			}
@@ -460,11 +483,17 @@ func pickInitial(p *peerPlan) {
 func (dm *Daemon) orderedFor(pub wgtypes.Key, mine []Candidate, rec *Record) []Candidate {
 	order := OrderEndpoints(mine, rec.Candidates)
 	obs := dm.dev.Endpoint(pub)
-	if obs == nil || obs.IP == nil {
+	if obs == nil || obs.IP == nil || obs.IP.IsLinkLocalUnicast() {
 		return order
 	}
 	obsCand := Candidate{Type: CandPRFLX, Addr: obs.String()}
-	if containsCandidate(order, obsCand) {
+	if containsAddr(order, obsCand.Addr) {
+		return order
+	}
+	// A private observation is only meaningful inside a shared edge: a peer
+	// that roamed to a LAN address while it was here and has since moved
+	// sites would otherwise send us dialing our own private space.
+	if mode, _ := sameNAT(mine, rec.Candidates); mode == modeDifferentSites && isPrivateCandidate(obsCand) {
 		return order
 	}
 	return append([]Candidate{obsCand}, order...)

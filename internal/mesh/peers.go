@@ -83,9 +83,12 @@ func stableSortCandidates(cs []Candidate) {
 	sort.SliceStable(cs, func(i, j int) bool { return cs[i].score < cs[j].score })
 }
 
-func containsCandidate(cands []Candidate, c Candidate) bool {
+// containsAddr reports whether any candidate (of any type) targets addr.
+// Type-blind on purpose: a prflx observation equal to an advertised address
+// must not be dialed twice.
+func containsAddr(cands []Candidate, addr string) bool {
 	for _, x := range cands {
-		if x.Type == c.Type && x.Addr == c.Addr {
+		if x.Addr == addr {
 			return true
 		}
 	}
