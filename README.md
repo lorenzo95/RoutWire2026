@@ -111,7 +111,9 @@ NET_ADMIN; details and the Windows/macOS caveats are in `compose.yaml`.
 - **Spokes for agent-less devices.** Phones, tablets, laptops — anything that
   can load a wg-quick config but can't run `meshd` — get an exported config.
   The hub peers them and source-NATs them into the mesh locally. Spoke names
-  never touch the DHT; they live only in `/etc/meshd.spokes` on their hub.
+  never touch the DHT; they live only in a `meshd.spokes` sidecar next to the
+  config (e.g. `/etc/meshd.spokes`, or `/etc/meshd/meshd.spokes` in the
+  container/compose layout) on their hub.
 
 ## Quick start (two nodes)
 
@@ -145,6 +147,9 @@ sudo systemctl restart meshd          # forwarding is enabled automatically
 sudo meshd export -remote phone-alice -out phone-alice.conf
 sudo meshd remove -remote phone-alice # ...and revoke it later
 ```
+
+`export`/`remove` register/unregister the remote's *name only* in the
+`meshd.spokes` sidecar next to the config, where the hub reads it each tick.
 
 ## CLI
 
