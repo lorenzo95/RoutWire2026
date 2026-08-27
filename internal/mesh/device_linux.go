@@ -176,6 +176,21 @@ func (ld *LinuxDevice) Handshake(pub wgtypes.Key) time.Time {
 	return time.Time{}
 }
 
+// Endpoint returns the peer's currently tracked endpoint as WireGuard knows
+// it (roamed from valid inbound packets), or nil if the peer has not engaged.
+func (ld *LinuxDevice) Endpoint(pub wgtypes.Key) *net.UDPAddr {
+	dev, err := ld.cl.Device(ld.iface)
+	if err != nil {
+		return nil
+	}
+	for _, p := range dev.Peers {
+		if p.PublicKey == pub {
+			return p.Endpoint
+		}
+	}
+	return nil
+}
+
 func (ld *LinuxDevice) Close() error { return ld.cl.Close() }
 
 // Delete removes the interface entirely (for `meshd stop` style cleanup).

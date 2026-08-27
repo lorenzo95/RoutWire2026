@@ -27,13 +27,21 @@ func TestOrderEndpointsSameNAT(t *testing.T) {
 
 func TestOrderEndpointsDifferentSites(t *testing.T) {
 	mine := []Candidate{hostC("192.168.1.10:51820"), srflxC("203.0.113.7:40000")}
-	theirs := []Candidate{hostC("192.168.1.99:51820"), srflxC("198.51.100.9:55555")}
+	theirs := []Candidate{hostC("192.168.1.99:51820"), srflxC("198.51.100.9:55555"), hostC("8.8.8.9:51820")}
 	got := OrderEndpoints(mine, theirs)
 	if got[0].Type != CandSRFLX {
 		t.Fatalf("different sites must try reflexive first, got %+v", got)
 	}
-	if got[len(got)-1].Addr != "192.168.1.99:51820" {
-		t.Fatalf("foreign LAN hosts must rank last, got %+v", got)
+	for _, c := range got {
+		if c.Type == CandHost && c.Addr == "192.168.1.99:51820" {
+			t.Fatalf("private foreign host candidate must be dropped across sites, got %+v", got)
+		}
+		if got[0].Type != CandSRFLX && c.Addr == "8.8.8.9:51820" {
+			t.Fatalf("public host must rank after reflexive, got %+v", got)
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("want srflx + public host only (2), got %+v", got)
 	}
 }
 
@@ -50,12 +58,12 @@ func TestOrderEndpointsStableAndTotal(t *testing.T) {
 	mine := []Candidate{hostC("10.0.0.1:1"), srflxC("203.0.113.7:40000")}
 	theirs := []Candidate{
 		hostC("192.168.1.21:51820"),
-		srflxC("198.51.100.9:55555"),
+		srflxC("203.0.113.7:55555"),
 		hostC("192.168.1.20:51820"),
 	}
 	got := OrderEndpoints(mine, theirs)
 	if len(got) != len(theirs) {
-		t.Fatal("ordering must not drop candidates")
+		t.Fatalf("same-NAT ordering must not drop candidates: got %d want %d", len(got), len(theirs))
 	}
 	for i := 1; i < len(got); i++ {
 		if got[i-1].score > got[i].score {
@@ -222,5 +230,78 @@ func TestTickReracesWhenHandshakeGoesStale(t *testing.T) {
 	}
 	if alpha.lastGood["beta"].Addr != "" {
 		t.Fatal("failed race must clear lastGood")
+	}
+}
+
+func TestOrderedForPrependsObserved(t *testing.T) {
+	store := engine.NewReliable(engine.NewMockStore(10*time.Minute, time.Now))
+	dev := NewFakeDevice()
+	alpha, d := newTestDaemon(t, "alpha", store, dev)
+	betaPub := pubKeyOf(t, d, "beta")
+	rec := &Record{
+		Name: "beta",
+		Candidates: []Candidate{
+			srflxC("198.51.100.9:55555"),
+			hostC("192.168.1.99:51820"), // foreign private host — must be dropped
+		},
+	}
+	mine := []Candidate{hostC("192.168.1.10:51820"), srflxC("203.0.113.7:40000")}
+
+	obsEP, _ := net.ResolveUDPAddr("udp", "172.219.208.229:48000")
+	dev.SetObserved(betaPub, obsEP)
+
+	order := alpha.orderedFor(betaPub, mine, rec)
+	if len(order) == 0 || order[0].Type != CandPRFLX {
+		t.Fatalf("observed endpoint must be the first (prflx) candidate, got %+v", order)
+	}
+	if order[0].Addr != "172.219.208.229:48000" {
+		t.Fatalf("wrong observed addr: %+v", order[0])
+	}
+	foundSrflx := false
+	for _, c := range order[1:] {
+		if c.Addr == "192.168.1.99:51820" {
+			t.Fatalf("private foreign host must be dropped across sites, got %+v", order)
+		}
+		if c.Type == CandSRFLX {
+			foundSrflx = true
+		}
+	}
+	if !foundSrflx {
+		t.Fatalf("advertised srflx must remain dialable, got %+v", order)
+	}
+}
+
+func TestTickPreservesFreshObservedWinner(t *testing.T) {
+	store := engine.NewReliable(engine.NewMockStore(10*time.Minute, time.Now))
+	dev := NewFakeDevice()
+	alpha, d := newTestDaemon(t, "alpha", store, dev)
+	betaPub := pubKeyOf(t, d, "beta")
+	obsAddr := "198.51.100.9:60000" // public observed endpoint
+
+	publishBeta(t, alpha, d, []Candidate{srflxC("198.51.100.9:55555")})
+	obsEP, _ := net.ResolveUDPAddr("udp", obsAddr)
+	dev.SetObserved(betaPub, obsEP)
+	dev.Reachable = func(ep *net.UDPAddr) bool { return ep != nil && ep.String() == obsAddr }
+	alpha.probe = func(net.IP, int) { dev.Traffic(betaPub) }
+
+	ctx := context.Background()
+	if err := alpha.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	if err := alpha.Tick(ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if alpha.lastGood["beta"].Addr != obsAddr {
+		t.Fatalf("expected observed endpoint to win the race, got %+v", alpha.lastGood["beta"])
+	}
+	applies := dev.Applies()
+
+	// A keepalive keeps the handshake fresh; the next tick must preserve the
+	// observed winner instead of flapping back to the advertised candidate.
+	if err := alpha.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if dev.Applies() > applies+1 {
+		t.Fatalf("fresh observed winner must be preserved (one idempotent apply), saw %d", dev.Applies()-applies)
 	}
 }

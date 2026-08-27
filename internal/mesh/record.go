@@ -12,8 +12,9 @@ import (
 type CandType string
 
 const (
-	CandHost  CandType = "host"
-	CandSRFLX CandType = "srflx"
+	CandHost   CandType = "host"
+	CandSRFLX  CandType = "srflx"
+	CandPRFLX  CandType = "prflx" // observed from the peer's own authenticated traffic; never published
 )
 
 // Candidate is one reachable socket for a node: host = a LAN/interface

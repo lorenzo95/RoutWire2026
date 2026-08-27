@@ -26,4 +26,9 @@ type Device interface {
 	Apply(peers []PeerDesire) error
 	ApplyRoutes(routes []net.IPNet) error
 	Handshake(pub wgtypes.Key) time.Time
+	// Endpoint returns the currently tracked endpoint for a peer — the one
+	// WireGuard has roamed to from the peer's own authenticated traffic, or
+	// nil if the peer has not engaged. This is the observed/peer-reflexive
+	// address, which is authoritative for reachability across NAT.
+	Endpoint(pub wgtypes.Key) *net.UDPAddr
 }

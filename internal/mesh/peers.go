@@ -44,14 +44,30 @@ func sameNAT(mine, theirs []Candidate) (natMode, bool) {
 }
 
 // OrderEndpoints ranks a peer's candidates for dialing. Same-NAT: LAN hosts
-// first (hairpin rarely works). Different sites: reflexive only is sensible,
-// hosts kept as harmless tail. Unknown: assume local-first.
+// first (hairpin rarely works), reflexive as fallback. Different sites: only
+// reflexive/public addresses are dialed — private RFC1918 host candidates are
+// ambiguous across edges (another site's 192.168.1.0/24 is not ours) and so
+// are dropped outright, never left as a footgun tail. Unknown: assume
+// local-first.
 func OrderEndpoints(mine, theirs []Candidate) []Candidate {
 	mode, _ := sameNAT(mine, theirs)
+
+	cands := append([]Candidate(nil), theirs...)
+	if mode == modeDifferentSites {
+		kept := cands[:0]
+		for _, c := range cands {
+			if c.Type == CandHost && isPrivateCandidate(c) {
+				continue
+			}
+			kept = append(kept, c)
+		}
+		cands = kept
+	}
+
 	hostScore := map[natMode]int{modeSharedNAT: 0, modeUnknown: 0, modeDifferentSites: 20}[mode]
 	srflxScore := map[natMode]int{modeSharedNAT: 10, modeUnknown: 10, modeDifferentSites: 10}[mode]
 
-	scored := append([]Candidate(nil), theirs...)
+	scored := cands
 	for i := range scored {
 		if scored[i].Type == CandSRFLX {
 			scored[i].score = srflxScore
@@ -70,6 +86,35 @@ func stableSortCandidates(cs []Candidate) {
 func containsCandidate(cands []Candidate, c Candidate) bool {
 	for _, x := range cands {
 		if x.Type == c.Type && x.Addr == c.Addr {
+			return true
+		}
+	}
+	return false
+}
+
+// isPrivateCandidate reports whether a host candidate's address is a private
+// (RFC1918) or CGNAT range. Such addresses are only meaningful inside the edge
+// that owns them; dialing them from a different site is at best useless and at
+// worst addresses our own private space.
+func isPrivateCandidate(c Candidate) bool {
+	h := hostOnly(c.Addr)
+	ip := net.ParseIP(h)
+	if ip == nil {
+		return false
+	}
+	return isPrivateIP(ip)
+}
+
+func isPrivateIP(ip net.IP) bool {
+	if p := ip.To4(); p != nil {
+		switch {
+		case p[0] == 10:
+			return true
+		case p[0] == 172 && p[1] >= 16 && p[1] <= 31:
+			return true
+		case p[0] == 192 && p[1] == 168:
+			return true
+		case p[0] == 100 && p[1] >= 64 && p[1] <= 127: // CGNAT
 			return true
 		}
 	}

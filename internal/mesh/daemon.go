@@ -226,7 +226,10 @@ func (dm *Daemon) Tick(ctx context.Context) error {
 
 	for i := range plans {
 		p := &plans[i]
-		if p.freshNow && p.haveWin && recHasEndpoint(p.rec, p.winner.Addr) {
+		if p.freshNow && p.haveWin {
+			// A live, freshly-handshaken winner — even one observed from the
+			// peer's own traffic (not advertised) — is left undisturbed so we
+			// never flap back to a stale advertised candidate.
 			continue
 		}
 		won := false
@@ -404,10 +407,10 @@ func (dm *Daemon) buildPlans(ctx context.Context, mine []Candidate) ([]peerPlan,
 				AllowedIPs: append(allowedIPsFor(rec), *allowed),
 				Keepalive:  25 * time.Second,
 			},
-			ordered: OrderEndpoints(mine, rec.Candidates),
-			winner:  dm.lastGood[name],
-			haveWin: dm.lastGood[name].Addr != "",
-		})
+		ordered: dm.orderedFor(pubKey, mine, rec),
+		winner:  dm.lastGood[name],
+		haveWin: dm.lastGood[name].Addr != "",
+	})
 	}
 	// Spokes live only on this hub (see syncNat): no roster record, but they
 	// still need a WireGuard peer so the phone's roaming handshake can land.
@@ -439,13 +442,32 @@ func (dm *Daemon) buildPlans(ctx context.Context, mine []Candidate) ([]peerPlan,
 }
 
 func pickInitial(p *peerPlan) {
-	if p.haveWin && recHasEndpoint(p.rec, p.winner.Addr) {
+	if p.haveWin {
 		p.desire.Endpoint = udpAddrOf(p.winner)
 		return
 	}
 	if len(p.ordered) > 0 {
 		p.desire.Endpoint = udpAddrOf(p.ordered[0])
 	}
+}
+
+// orderedFor builds a peer's dial order from its advertised candidates, then
+// prepends the endpoint WireGuard has observed from the peer's own traffic
+// (peer-reflexive) when it differs from what we'd otherwise dial. The observed
+// address is the authoritative "where the peer actually is right now" — it
+// survives symmetric NAT where an advertised srflx is only valid toward the
+// STUN server.
+func (dm *Daemon) orderedFor(pub wgtypes.Key, mine []Candidate, rec *Record) []Candidate {
+	order := OrderEndpoints(mine, rec.Candidates)
+	obs := dm.dev.Endpoint(pub)
+	if obs == nil || obs.IP == nil {
+		return order
+	}
+	obsCand := Candidate{Type: CandPRFLX, Addr: obs.String()}
+	if containsCandidate(order, obsCand) {
+		return order
+	}
+	return append([]Candidate{obsCand}, order...)
 }
 
 func stateWith(plans []peerPlan, i int, d PeerDesire) []PeerDesire {
@@ -460,15 +482,6 @@ func stateWith(plans []peerPlan, i int, d PeerDesire) []PeerDesire {
 func (dm *Daemon) overlayIPFor(name string) net.IP {
 	ip, _ := dm.d.OverlayIP(name, dm.cfg.CIDR)
 	return ip
-}
-
-func recHasEndpoint(rec *Record, addr string) bool {
-	for _, c := range rec.Candidates {
-		if c.Addr == addr {
-			return true
-		}
-	}
-	return false
 }
 
 func udpAddrOf(c Candidate) *net.UDPAddr {
