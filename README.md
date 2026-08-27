@@ -21,23 +21,44 @@ curl -fsSL https://raw.githubusercontent.com/lorenzo95/RoutWire2026/main/install
 
 Or grab a tarball directly from [Releases](https://github.com/lorenzo95/RoutWire2026/releases).
 
-Container (host kernel provides WireGuard; container programs it):
+Container (the container shares the host kernel, which provides WireGuard, and
+programs it with host networking): first write a config, then run it:
 
 ```sh
-sudo sysctl -w net.ipv4.ip_forward=1        # once per host (needed for spoke NAT)
+# 1) init — generate a config (writes to host /etc/meshd.yaml)
+docker run --rm --name meshd-init -v /etc/meshd.yaml:/etc/meshd.yaml \
+  ghcr.io/lorenzo95/routewire2026 init -name alpha -out /etc/meshd.yaml
 
+# 2) run — the daemon, restarted across reboots
 docker run -d --name meshd --restart unless-stopped \
   --network=host --cap-add=NET_ADMIN \
   -v /etc/meshd.yaml:/etc/meshd.yaml:ro \
-  ghcr.io/lorenzo95/routewire2026 [-config /etc/meshd.yaml]
+  ghcr.io/lorenzo95/routewire2026
 ```
 
 Images are multi-arch (amd64/arm64): `ghcr.io/lorenzo95/routewire2026:<tag>` / `:latest`.
-With host networking the container's iptables calls program the **host** tables;
-`--sysctl` is not permitted under host networking, so set forwarding on the
-host as above (meshd degrades gracefully and warns if iptables/forwarding are
-unavailable). On networks that intercept TLS add `-dht-insecure` (payloads
-remain end-to-end sealed+signed).
+With host networking the container's iptables and forwarding calls program the
+**host** tables. No manual `sysctl` is needed on Docker hosts: `dockerd`
+enables `ip_forward` globally for its own bridge NAT, and meshd detects that
+and moves on (a bare-metal node enables it itself). `--sysctl` is not permitted
+under host networking, so standalone hosts that already disabled forwarding
+should `sysctl -w net.ipv4.ip_forward=1` once. On networks that intercept TLS
+add `-dht-insecure` (payloads remain end-to-end sealed+signed).
+
+Or use the shipped compose stack (`compose.yaml`):
+
+```sh
+# 1) init — write /etc/meshd/meshd.yaml (+ PSK) via the one-shot helper
+sudo MESH_PSK='<psk>' docker compose run --rm meshd-init \
+     init -name alpha -out /etc/meshd/meshd.yaml
+
+# 2) run — the daemon
+sudo docker compose up -d
+```
+
+The stack also binds the config under `/etc/meshd/` inside the container and
+runs with host networking + NET_ADMIN; details and the Windows/macOS caveats
+are in `compose.yaml`.
 
 ## How it works
 
