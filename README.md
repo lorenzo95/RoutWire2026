@@ -22,14 +22,18 @@ curl -fsSL https://raw.githubusercontent.com/lorenzo95/RoutWire2026/main/install
 Or grab a tarball directly from [Releases](https://github.com/lorenzo95/RoutWire2026/releases).
 
 Container (the container shares the host kernel, which provides WireGuard, and
-programs it with host networking): first write a config, then run it. Mount a
-`/etc/meshd` **directory** (a file mount would be created as a directory the
-first time, so the config can't be written into it):
+programs it with host networking). Mount a `/etc/meshd` **directory** — a *file*
+mount would be created as a directory the first time, so the config couldn't be
+written into it. The flow is always: **init** (write the config), then **run**
+(the daemon). On the first node `init` generates the mesh PSK; every other node
+reuses it with `-psk`.
+
+**Node A** (first in the mesh — generates the PSK):
 
 ```sh
 sudo mkdir -p /etc/meshd
 
-# 1) init — generate a config (writes /etc/meshd/meshd.yaml on the host)
+# 1) init — writes /etc/meshd/meshd.yaml, prints the mesh PSK
 sudo docker run --rm --name meshd-init \
   -v /etc/meshd:/etc/meshd \
   ghcr.io/lorenzo95/routewire2026 init -name alpha -out /etc/meshd/meshd.yaml
@@ -41,6 +45,29 @@ sudo docker run -d --name meshd --restart unless-stopped \
   ghcr.io/lorenzo95/routewire2026 -config /etc/meshd/meshd.yaml
 ```
 
+**Node B** (join — same PSK, different name), identical run command:
+
+```sh
+sudo mkdir -p /etc/meshd
+
+# 1) init — same PSK as node A, different name
+sudo docker run --rm --name meshd-init \
+  -v /etc/meshd:/etc/meshd \
+  ghcr.io/lorenzo95/routewire2026 init -name beta \
+  -psk '<psk-from-node-a>' -out /etc/meshd/meshd.yaml
+
+# 2) run — identical to node A
+sudo docker run -d --name meshd --restart unless-stopped \
+  --network=host --cap-add=NET_ADMIN \
+  -v /etc/meshd:/etc/meshd:ro \
+  ghcr.io/lorenzo95/routewire2026 -config /etc/meshd/meshd.yaml
+```
+
+Within ~45s both nodes find each other and the overlay is encrypted (verify with
+`meshd peek`, or `ping` the peer's overlay address shown by `init`). The run
+commands are identical on every node — only the `init` differs (first node
+omits `-psk`).
+
 Images are multi-arch (amd64/arm64): `ghcr.io/lorenzo95/routewire2026:<tag>` / `:latest`.
 With host networking the container's iptables and forwarding calls program the
 **host** tables. No manual `sysctl` is needed on Docker hosts: `dockerd`
@@ -50,21 +77,21 @@ under host networking, so standalone hosts that already disabled forwarding
 should `sysctl -w net.ipv4.ip_forward=1` once. On networks that intercept TLS
 add `-dht-insecure` (payloads remain end-to-end sealed+signed).
 
-Or use the shipped compose stack (`compose.yaml`):
+Or use the shipped compose stack (`compose.yaml`) — same init-then-run shape:
 
 ```sh
-# 1) init — write /etc/meshd/meshd.yaml (and generate the PSK) for the first node
+# node A: init (generates PSK), then run
 sudo docker compose run --rm meshd-init init -name alpha -out /etc/meshd/meshd.yaml
+sudo docker compose up -d
 
-# ...other nodes reuse that PSK: sudo MESH_PSK='<psk>' docker compose run ... init -name beta ...
-
-# 2) run — the daemon
+# node B: init (same PSK, different name), then run
+sudo MESH_PSK='<psk-from-node-a>' docker compose run --rm \
+     meshd-init init -name beta -out /etc/meshd/meshd.yaml
 sudo docker compose up -d
 ```
 
-The stack also binds the config under `/etc/meshd/` inside the container and
-runs with host networking + NET_ADMIN; details and the Windows/macOS caveats
-are in `compose.yaml`.
+The stack binds config under `/etc/meshd/` and runs with host networking +
+NET_ADMIN; details and the Windows/macOS caveats are in `compose.yaml`.
 
 ## How it works
 
