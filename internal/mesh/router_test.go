@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -357,5 +358,52 @@ func TestMentionsPortWholeField(t *testing.T) {
 	}
 	if !mentionsPort("-p udp --dport 51822 -j ACCEPT", "51822") {
 		t.Fatal("plain dport must match")
+	}
+}
+
+// AnnounceNAT reconciles masquerade rules for announced subnets: adds new,
+// removes dropped, idempotent across ticks, and Close removes everything.
+func TestAnnounceNATReconciles(t *testing.T) {
+	logFile := shimBinaries(t, false)
+	l, _ := captureLog(t)
+
+	_, overlay, _ := net.ParseCIDR("10.99.0.0/16")
+	_, lan1, _ := net.ParseCIDR("192.168.1.0/24")
+	_, lan2, _ := net.ParseCIDR("192.168.50.0/24")
+
+	r := &linuxRouter{iface: "wgtest0", port: 51822, added: map[string]bool{}, announceNAT: map[string]string{}, log: l}
+	if err := r.AnnounceNAT(overlay, []net.IPNet{*lan1}); err != nil {
+		t.Fatalf("announce nat: %v", err)
+	}
+	if err := r.AnnounceNAT(overlay, []net.IPNet{*lan1}); err != nil {
+		t.Fatalf("idempotent re-announce: %v", err)
+	}
+	b, _ := os.ReadFile(logFile)
+	if got := strings.Count(string(b), "-s 10.99.0.0/16 -d 192.168.1.0/24"); got != 1 {
+		t.Fatalf("want exactly one masquerade rule per announcement, got %d:\n%s", got, b)
+	}
+
+	// Add a second announcement, drop the first: only the second remains.
+	if err := r.AnnounceNAT(overlay, []net.IPNet{*lan2}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	b, _ = os.ReadFile(logFile)
+	if !strings.Contains(string(b), "-d 192.168.50.0/24") {
+		t.Fatal("second announcement must be added")
+	}
+	if strings.Count(string(b), "-D POSTROUTING -s 10.99.0.0/16 -d 192.168.1.0/24") != 1 {
+		t.Fatalf("dropped announcement's rule must be removed:\n%s", b)
+	}
+
+	// Close removes the remainder.
+	if err := r.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	b, _ = os.ReadFile(logFile)
+	if strings.Count(string(b), "-D POSTROUTING -s 10.99.0.0/16 -d 192.168.50.0/24") != 1 {
+		t.Fatalf("close must remove remaining announce rules:\n%s", b)
+	}
+	if len(r.announceNAT) != 0 {
+		t.Fatalf("tracking must be empty after close, got %+v", r.announceNAT)
 	}
 }

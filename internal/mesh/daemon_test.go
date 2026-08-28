@@ -2,9 +2,11 @@ package mesh
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -157,18 +159,49 @@ func TestTickRacesAndRemembersWinner(t *testing.T) {
 }
 
 type recRouter struct {
-	fwd     int
-	added   []string
-	removed []string
+	fwd      int
+	added    []string
+	removed  []string
+	announce []string
 }
 
 func (n *recRouter) Forwarding() error        { n.fwd++; return nil }
 func (n *recRouter) AddSource(ip net.IP) error { n.added = append(n.added, ip.String()); return nil }
+func (n *recRouter) AnnounceNAT(overlay *net.IPNet, subnets []net.IPNet) error {
+	n.announce = append(n.announce, overlay.String()+" "+fmt.Sprint(subnets))
+	return nil
+}
 func (n *recRouter) RemoveSource(ip net.IP) error {
 	n.removed = append(n.removed, ip.String())
 	return nil
 }
 func (n *recRouter) Close() error { return nil }
+
+// A node that announces subnets must reconcile masquerade rules so overlay
+// visitors can reach LAN devices that cannot route overlay addresses back.
+func TestSyncNatReconcilesAnnounceMasquerade(t *testing.T) {
+	store := engine.NewReliable(engine.NewMockStore(10*time.Minute, time.Now))
+	n := &recRouter{}
+	dm, _ := newTestDaemon(t, "alpha", store, NewFakeDevice())
+	dm.router = n
+	dm.cfg.Announce = []string{"192.168.1.0/24"}
+
+	dm.syncNat()
+
+	if len(n.announce) == 0 {
+		t.Fatal("syncNat must reconcile announce masquerade rules")
+	}
+	if !strings.Contains(n.announce[0], "10.99.0.0/16") || !strings.Contains(n.announce[0], "192.168.1.0") {
+		t.Fatalf("announce nat must masquerade the overlay into the announced subnet, got %v", n.announce)
+	}
+
+	// Dropping the announcement removes the rule.
+	dm.cfg.Announce = nil
+	dm.syncNat()
+	if !strings.Contains(n.announce[len(n.announce)-1], "[]") {
+		t.Fatalf("empty announcements must reconcile to no rules, got %v", n.announce)
+	}
+}
 
 func TestSpokePeerAndNat(t *testing.T) {
 	store := engine.NewReliable(engine.NewMockStore(10*time.Minute, time.Now))

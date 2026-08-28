@@ -360,6 +360,13 @@ func (dm *Daemon) syncNat() {
 		}
 		dm.fwdWarned = true
 	}
+	// Announced subnets: overlay visitors are masqueraded into them, since
+	// LAN devices reply through their default gateway and cannot route
+	// overlay addresses back. Reconciled every tick against the current
+	// announcements.
+	if err := dm.router.AnnounceNAT(dm.cfg.CIDR, parseCIDRs(dm.cfg.Announce)); err != nil {
+		dm.log.Printf("router: announce nat: %v", err)
+	}
 	want := make(map[string]net.IP)
 	for name := range dm.spokes {
 		if ip, err := dm.d.OverlayIP(name, dm.cfg.CIDR); err == nil {

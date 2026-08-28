@@ -40,6 +40,11 @@ type Router interface {
 	AddSource(spoke net.IP) error
 	// RemoveSource stops masquerading spoke/32.
 	RemoveSource(spoke net.IP) error
+	// AnnounceNAT reconciles source-NAT rules that masquerade overlay
+	// visitors into announced subnets (whose devices cannot route back over
+	// the overlay). Pass the current announcements every tick; rules for
+	// dropped announcements are removed.
+	AnnounceNAT(overlay *net.IPNet, subnets []net.IPNet) error
 	// Close removes firewall + masquerade rules and restores forwarding.
 	Close() error
 }
@@ -47,10 +52,11 @@ type Router interface {
 // noopRouter is used when routing integration is disabled (dry-run, tests).
 type noopRouter struct{}
 
-func (noopRouter) Forwarding() error        { return nil }
-func (noopRouter) AddSource(net.IP) error   { return nil }
+func (noopRouter) Forwarding() error         { return nil }
+func (noopRouter) AddSource(net.IP) error    { return nil }
 func (noopRouter) RemoveSource(net.IP) error { return nil }
-func (noopRouter) Close() error             { return nil }
+func (noopRouter) AnnounceNAT(*net.IPNet, []net.IPNet) error { return nil }
+func (noopRouter) Close() error              { return nil }
 
 // Package-level binary names so tests can shim them via PATH.
 var (
@@ -60,15 +66,16 @@ var (
 
 // linuxRouter implements Router with iptables + /proc/sys/net/ipv4/ip_forward.
 type linuxRouter struct {
-	iface    string
-	port     int
-	log      *log.Logger
-	mu       sync.Mutex
-	added    map[string]bool
-	fwdSet   bool
-	fwdFixed bool
-	priorFwd string
-	hasIP6   bool
+	iface        string
+	port         int
+	log          *log.Logger
+	mu           sync.Mutex
+	added        map[string]bool
+	announceNAT  map[string]string
+	fwdSet       bool
+	fwdFixed     bool
+	priorFwd     string
+	hasIP6       bool
 	taggedChains []*nftables.Chain
 }
 
@@ -97,11 +104,12 @@ func NewLinuxRouter(iface string, port int, log *log.Logger) (Router, error) {
 		return noopRouter{}, fmt.Errorf("%w", ErrNoIptables)
 	}
 	r := &linuxRouter{
-		iface:    iface,
-		port:     port,
-		log:      log,
-		added:    make(map[string]bool),
-		priorFwd: strings.TrimSpace(string(prior)),
+		iface:       iface,
+		port:        port,
+		log:         log,
+		added:       make(map[string]bool),
+		announceNAT: make(map[string]string),
+		priorFwd:    strings.TrimSpace(string(prior)),
 	}
 	if _, err := exec.LookPath(ip6tablesBin); err == nil {
 		r.hasIP6 = true
@@ -472,11 +480,56 @@ func (r *linuxRouter) AddSource(spoke net.IP) error {
 	if r.added[src] {
 		return nil
 	}
-	err := r.run("nat", "-I", "POSTROUTING", "1", "-s", src, "-o", r.iface, "-j", "MASQUERADE")
-	if err != nil {
+	if err := r.run("nat", "-I", "POSTROUTING", "1", "-s", src, "-o", r.iface, "-j", "MASQUERADE"); err != nil {
 		return err
 	}
 	r.added[src] = true
+	return nil
+}
+
+// AnnounceNAT reconciles source-NAT rules that let overlay visitors reach
+// announced subnets. Devices inside an announced subnet (a home LAN, for
+// example) reply through their default gateway and cannot route overlay
+// addresses back — so traffic leaving this node toward an announced subnet
+// is masqueraded to this node's address on the egress interface, and the
+// return path rides conntrack. Reconciling: rules for announcements absent
+// from the current set are removed. All rules are removed on Close.
+func (r *linuxRouter) AnnounceNAT(overlay *net.IPNet, subnets []net.IPNet) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	want := make(map[string]string, len(subnets)) // key -> dst subnet
+	for _, sub := range subnets {
+		if sub.IP.To4() == nil {
+			continue
+		}
+		want[overlay.String()+"|"+sub.String()] = sub.String()
+	}
+	// Remove rules for announcements that disappeared.
+	for key, dst := range r.announceNAT {
+		if _, ok := want[key]; ok {
+			continue
+		}
+		src := strings.SplitN(key, "|", 2)[0]
+		if err := r.run("nat", "-D", "POSTROUTING", "-s", src, "-d", dst, "-j", "MASQUERADE"); err != nil && r.log != nil {
+			r.log.Printf("router: remove announce nat %s: %v", key, err)
+		}
+		delete(r.announceNAT, key)
+	}
+	// Add rules for new announcements.
+	for key, dst := range want {
+		if _, ok := r.announceNAT[key]; ok {
+			continue
+		}
+		src := strings.SplitN(key, "|", 2)[0]
+		if err := r.run("nat", "-I", "POSTROUTING", "1", "-s", src, "-d", dst, "-j", "MASQUERADE"); err != nil {
+			if r.log != nil {
+				r.log.Printf("router: announce nat %s: %v", key, err)
+			}
+			continue
+		}
+		r.announceNAT[key] = dst
+	}
 	return nil
 }
 
@@ -503,6 +556,13 @@ func (r *linuxRouter) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var first error
+	for key, dst := range r.announceNAT {
+		src := strings.SplitN(key, "|", 2)[0]
+		if err := r.run("nat", "-D", "POSTROUTING", "-s", src, "-d", dst, "-j", "MASQUERADE"); err != nil && first == nil {
+			first = err
+		}
+	}
+	r.announceNAT = make(map[string]string)
 	for src := range r.added {
 		if err := r.run("nat", "-D", "POSTROUTING", "-s", src, "-o", r.iface, "-j", "MASQUERADE"); err != nil && first == nil {
 			first = err

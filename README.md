@@ -148,6 +148,12 @@ sudo meshd export -remote phone-alice -out phone-alice.conf
 sudo meshd remove -remote phone-alice # ...and revoke it later
 ```
 
+Visitors reaching an announced subnet are **masqueraded to the announcing
+node's LAN address** — devices inside the subnet reply normally, no static
+routes needed on the LAN. (To go route-based instead, add a route for the
+mesh CIDR pointing at the announcing node on your LAN router and remove the
+masquerade rule meshd manages.)
+
 `export`/`remove` register/unregister the remote's *name only* in the
 `meshd.spokes` sidecar next to the config, where the hub reads it each tick.
 
