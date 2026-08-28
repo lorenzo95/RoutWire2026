@@ -223,7 +223,7 @@ run 'meshd -h' for every flag and subcommand.
 		if err != nil {
 			fatalf("device: %v", err)
 		}
-		rtr, err := mesh.NewLinuxRouter(resolved.IFace, resolved.Port)
+		rtr, err := mesh.NewLinuxRouter(resolved.IFace, resolved.Port, logger)
 		switch {
 		case errors.Is(err, mesh.ErrNoIptables):
 			logger.Printf("warning: %v — port/forwarding/NAT management disabled; handle on the host", err)

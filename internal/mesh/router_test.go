@@ -1,12 +1,17 @@
 package mesh
 
 import (
+	"bytes"
 	"errors"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/google/nftables"
+	"github.com/google/nftables/expr"
 )
 
 func TestForwardingAlreadyEnabledNeedsNoWrite(t *testing.T) {
@@ -71,8 +76,214 @@ func TestNewLinuxRouterWithoutIptables(t *testing.T) {
 	if _, err := exec.LookPath("iptables"); err == nil {
 		t.Skip("iptables present; nothing to test")
 	}
-	_, err := NewLinuxRouter("wgtest0", 51820)
+	_, err := NewLinuxRouter("wgtest0", 51820, nil)
 	if !errors.Is(err, ErrNoIptables) {
 		t.Fatalf("want ErrNoIptables, got %v", err)
+	}
+}
+
+// shimBinaries drops fake iptables/ip6tables into a temp dir on PATH. The
+// fakes log every invocation and fail -C probes (rule "not present") so
+// openPort always takes the insert path.
+func shimBinaries(t *testing.T, withIP6 bool) string {
+	t.Helper()
+	dir := t.TempDir()
+	log := filepath.Join(dir, "calls")
+	names := []string{iptablesBin}
+	if withIP6 {
+		names = append(names, ip6tablesBin)
+	}
+	script := "#!/bin/sh\necho \"$0 $@\" >> " + log + "\nfor a in \"$@\"; do [ \"$a\" = \"-C\" ] && exit 1; done\nexit 0\n"
+	for _, name := range names {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir)
+	return log
+}
+
+func TestOpenPortInsertsBothFamilies(t *testing.T) {
+	log := shimBinaries(t, true)
+
+	r := &linuxRouter{iface: "wgtest0", port: 51822, added: map[string]bool{}, hasIP6: true}
+	if err := r.openPort(); err != nil {
+		t.Fatalf("openPort: %v", err)
+	}
+	b, _ := os.ReadFile(log)
+	calls := string(b)
+	if got := strings.Count(calls, "-I INPUT 1 -p udp --dport 51822"); got != 2 {
+		t.Fatalf("transport port must open in BOTH families (v4 + v6), got %d inserts:\n%s", got, calls)
+	}
+	if !strings.Contains(calls, ip6tablesBin) {
+		t.Fatalf("ip6tables must be invoked for the v6 family, got:\n%s", calls)
+	}
+
+	// Close must remove what was added, in both families.
+	if err := r.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	b, _ = os.ReadFile(log)
+	calls = string(b)
+	if got := strings.Count(calls, "-D INPUT -p udp --dport 51822"); got != 2 {
+		t.Fatalf("close must remove the rule in both families, got %d removals:\n%s", got, calls)
+	}
+}
+
+func TestOpenPortDegradesToV4WithoutIP6tables(t *testing.T) {
+	log := shimBinaries(t, false)
+
+	r := &linuxRouter{iface: "wgtest0", port: 51822, added: map[string]bool{}, hasIP6: false}
+	if err := r.openPort(); err != nil {
+		t.Fatalf("openPort without ip6tables must still open v4, got %v", err)
+	}
+	b, _ := os.ReadFile(log)
+	calls := string(b)
+	if strings.Count(calls, "-I INPUT 1") != 1 || strings.Contains(calls, ip6tablesBin) {
+		t.Fatalf("v4-only host must insert exactly one rule and never call ip6tables:\n%s", calls)
+	}
+}
+
+// captureLog returns a logger plus a func that yields everything it printed.
+func captureLog(t *testing.T) (*log.Logger, func() string) {
+	t.Helper()
+	var buf bytes.Buffer
+	l := log.New(&buf, "", 0)
+	return l, buf.String
+}
+
+// Live remediation against the real kernel: a foreign inet chain with a
+// drop policy and no rule for our port gets an accept inserted (tagged via
+// rule userdata), and Close removes it again. Skips without root or netlink.
+// The hostile chain is created atomically together with a catch-all accept
+// so its drop policy can never sever live traffic mid-test.
+func TestRouterRemediatesForeignDropChainLive(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root for netlink")
+	}
+	conn, err := nftables.New()
+	if err != nil {
+		t.Skipf("no netlink: %v", err)
+	}
+	hook, prio, policy := *nftables.ChainHookInput, *nftables.ChainPriorityFilter, nftables.ChainPolicyDrop
+	tbl := &nftables.Table{Name: "routewire-test", Family: nftables.TableFamilyINet}
+	ch := &nftables.Chain{
+		Name: "input", Table: tbl,
+		Hooknum: &hook, Priority: &prio, Policy: &policy,
+		Type: nftables.ChainTypeFilter,
+	}
+	conn.AddTable(tbl)
+	conn.AddChain(ch)
+	// Catch-all accept in the same atomic batch: the chain still counts as
+	// blocking (drop policy, no rule for our port) but harmless to traffic.
+	conn.AddRule(&nftables.Rule{Table: tbl, Chain: ch, Exprs: []expr.Any{
+		&expr.Verdict{Kind: expr.VerdictAccept},
+	}})
+	if err := conn.Flush(); err != nil {
+		t.Skipf("cannot create test chain: %v", err)
+	}
+	defer func() {
+		c, err := nftables.New()
+		if err == nil {
+			c.DelTable(tbl)
+			c.Flush()
+		}
+	}()
+
+	l, printed := captureLog(t)
+	r := &linuxRouter{iface: "wgtest0", port: 51999, added: map[string]bool{}, hasIP6: false}
+	r.remediateForeignDropChains(l, 51999)
+	if len(r.nftChains) == 0 {
+		t.Fatalf("drop-policy chain lacking our port must be remediated, log: %s", printed())
+	}
+
+	// The inserted rule is tagged and visible via netlink.
+	rules, err := conn.GetRules(tbl, ch)
+	if err != nil {
+		t.Fatalf("get rules: %v", err)
+	}
+	tagged := 0
+	for _, rule := range rules {
+		if string(rule.UserData) == nftComment {
+			tagged++
+		}
+	}
+	if tagged != 1 {
+		t.Fatalf("want exactly one tagged accept for udp/51999, got %d", tagged)
+	}
+	if out := printed(); !strings.Contains(out, "opened udp/51999") {
+		t.Fatalf("successful remediation must be logged, got: %s", out)
+	}
+
+	// Close removes the tagged rule, leaves the rest of the chain alone.
+	if err := r.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	rules, err = conn.GetRules(tbl, ch)
+	if err != nil {
+		t.Fatalf("get rules after close: %v", err)
+	}
+	for _, rule := range rules {
+		if string(rule.UserData) == nftComment {
+			t.Fatal("close must remove our remediation rule")
+		}
+	}
+}
+
+func TestWarnBlockedFromSaveFlagsLegacyDrop(t *testing.T) {
+	l, printed := captureLog(t)
+	dump := `*filter
+:INPUT DROP [0:0]
+-A INPUT -i lo -j ACCEPT
+COMMIT
+*nat
+:POSTROUTING ACCEPT [0:0]
+COMMIT`
+	warnBlockedFromSave(l, "iptables-save", "51822", dump)
+	out := printed()
+	if !strings.Contains(out, `"INPUT"`) || !strings.Contains(out, "51822") {
+		t.Fatalf("legacy DROP policy without our port must be reported, got: %s", out)
+	}
+
+	// An allow rule for the port silences the warning.
+	dump = `*filter
+:INPUT DROP [0:0]
+-A INPUT -p udp --dport 51822 -j ACCEPT
+COMMIT`
+	l, printed = captureLog(t)
+	warnBlockedFromSave(l, "iptables-save", "51822", dump)
+	if out := printed(); out != "" {
+		t.Fatalf("legacy allowlisted port must not warn, got: %s", out)
+	}
+}
+
+// Docker sets FORWARD policy DROP on every host — that must never warn.
+func TestWarnBlockedFromSaveIgnoresForwardPolicy(t *testing.T) {
+	l, printed := captureLog(t)
+	dump := `*filter
+:INPUT ACCEPT [0:0]
+:FORWARD DROP [0:0]
+-A FORWARD -j DOCKER-USER
+COMMIT`
+	warnBlockedFromSave(l, "ip6tables-save", "51822", dump)
+	if out := printed(); out != "" {
+		t.Fatalf("FORWARD drop policy is not our business, got: %s", out)
+	}
+}
+
+// The Pangolin scenario, end to end: a foreign inet chain with a drop policy
+// that lacks our port gets an accept inserted (tagged via userdata) and the
+// insertion is undone on Close. Exercised live by
+// TestRouterRemediatesForeignDropChain above.
+
+func TestMentionsPortWholeField(t *testing.T) {
+	if !mentionsPort("udp dport { 443, 21820, 51820 } accept", "51820") {
+		t.Fatal("set literal member must match")
+	}
+	if mentionsPort("udp dport { 443, 21820, 51820 } accept", "5182") {
+		t.Fatal("partial port must not match")
+	}
+	if !mentionsPort("-p udp --dport 51822 -j ACCEPT", "51822") {
+		t.Fatal("plain dport must match")
 	}
 }

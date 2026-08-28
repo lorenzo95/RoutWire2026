@@ -373,6 +373,40 @@ func TestTickAdoptsKernelEndpointForLiveSession(t *testing.T) {
 	}
 }
 
+func TestTickDoesNotClobberRoamedEndpointOfLiveSession(t *testing.T) {
+	store := engine.NewReliable(engine.NewMockStore(10*time.Minute, time.Now))
+	dev := NewFakeDevice()
+	alpha, d := newTestDaemon(t, "alpha", store, dev)
+	betaPub := pubKeyOf(t, d, "beta")
+
+	publishBeta(t, alpha, d, []Candidate{srflxC("198.51.100.9:55555")})
+	dev.Reachable = func(*net.UDPAddr) bool { return true }
+	alpha.probe = func(net.IP, int) { dev.Traffic(betaPub) }
+
+	ctx := context.Background()
+	if err := alpha.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	if err := alpha.Tick(ctx); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+
+	// The peer then roams: WireGuard tracks a fresher source than our last
+	// recorded winner. A live session owns its endpoint — the idempotent
+	// Apply must omit it (nil = leave unchanged), never re-assert the winner.
+	newEP, _ := net.ResolveUDPAddr("udp", "198.51.100.9:60000")
+	dev.SetObserved(betaPub, newEP)
+	if err := alpha.Tick(ctx); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	last := dev.History[len(dev.History)-1]
+	for _, p := range last {
+		if p.Name == "beta" && p.Endpoint != nil {
+			t.Fatalf("live session endpoint must not be re-asserted (kernel roams), got %s", p.Endpoint)
+		}
+	}
+}
+
 func TestOrderedForDedupesObservedByAddr(t *testing.T) {
 	store := engine.NewReliable(engine.NewMockStore(10*time.Minute, time.Now))
 	dev := NewFakeDevice()

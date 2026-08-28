@@ -3,17 +3,26 @@ package mesh
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
+
+	"github.com/google/nftables"
+	"github.com/google/nftables/expr"
+	"golang.org/x/sys/unix"
 )
 
 // ErrNoIptables is returned by NewLinuxRouter when the iptables binary is
 // unavailable (e.g. minimal containers). Callers may fall back to a no-op
 // router and manage firewall/forwarding on the host themselves.
 var ErrNoIptables = errors.New("iptables executable not found")
+
+// nftComment tags rules meshd inserts into foreign firewalls so operators can
+// see why they exist and Close can find them again.
+const nftComment = "routewire-meshd"
 
 // Router integrates the daemon with kernel routing + firewall state that a
 // mesh node needs beyond the WireGuard interface itself:
@@ -43,6 +52,12 @@ func (noopRouter) AddSource(net.IP) error   { return nil }
 func (noopRouter) RemoveSource(net.IP) error { return nil }
 func (noopRouter) Close() error             { return nil }
 
+// Package-level binary names so tests can shim them via PATH.
+var (
+	iptablesBin  = "iptables"
+	ip6tablesBin = "ip6tables"
+)
+
 // linuxRouter implements Router with iptables + /proc/sys/net/ipv4/ip_forward.
 type linuxRouter struct {
 	iface    string
@@ -51,12 +66,21 @@ type linuxRouter struct {
 	added    map[string]bool
 	fwdSet   bool
 	priorFwd string
+	hasIP6   bool
+	nftChains []*nftables.Chain
 }
+
+// nftRule is an accept we inserted into a foreign input-hook chain that would
+// otherwise drop our listen port. Tagged with a routewire comment in the
+// ruleset so operators can see why they exist; removed on Close.
 
 // NewLinuxRouter opens the WireGuard UDP listen port in the firewall and
 // prepares forwarding (enabled lazily via Forwarding). It must be called with
-// the interface name the daemon manages.
-func NewLinuxRouter(iface string, port int) (Router, error) {
+// the interface name the daemon manages. log (nil-tolerant) receives notices
+// about foreign firewalls: chains that would drop the listen port get an
+// accept inserted (tracked, removed on Close); chains meshd cannot open are
+// reported as warnings.
+func NewLinuxRouter(iface string, port int, log *log.Logger) (Router, error) {
 	if iface == "" {
 		return nil, fmt.Errorf("router: empty iface")
 	}
@@ -67,7 +91,7 @@ func NewLinuxRouter(iface string, port int) (Router, error) {
 	if err != nil {
 		return nil, fmt.Errorf("router: read ip_forward: %w", err)
 	}
-	if _, err := exec.LookPath("iptables"); err != nil {
+	if _, err := exec.LookPath(iptablesBin); err != nil {
 		return noopRouter{}, fmt.Errorf("%w", ErrNoIptables)
 	}
 	r := &linuxRouter{
@@ -76,19 +100,184 @@ func NewLinuxRouter(iface string, port int) (Router, error) {
 		added:    make(map[string]bool),
 		priorFwd: strings.TrimSpace(string(prior)),
 	}
+	if _, err := exec.LookPath(ip6tablesBin); err == nil {
+		r.hasIP6 = true
+	}
 	if err := r.openPort(); err != nil {
 		return nil, fmt.Errorf("router: open port: %w", err)
 	}
+	r.remediateForeignDropChains(log, uint16(port))
+	warnBlockedPort(log, port)
 	return r, nil
 }
 
-// openPort inserts an INPUT accept for the UDP listen port if not already
-// present, so a restrictive host firewall cannot block handshakes.
-func (r *linuxRouter) openPort() error {
-	if err := r.run("filter", "-C", "INPUT", "-p", "udp", "--dport", fmt.Sprintf("%d", r.port), "-j", "ACCEPT"); err == nil {
-		return nil // already present (admin rule counts too)
+// netfilter has no cross-chain exemption: an ACCEPT in one base chain does
+// not carry past another chain's DROP at the same hook, and DROP is terminal.
+// So a host firewall whose input hook has a drop policy that lacks our port
+// will silently eat every inbound handshake no matter what meshd adds
+// elsewhere — and nothing in wg's counters admits to it. The only fix is an
+// allowlist entry in that chain; the only thing meshd can do is say so
+// loudly at startup instead of letting the operator discover it forensically.
+
+// warnBlockedPort scans nft and iptables-save for input-hook chains with a
+// drop policy that never mention the listen port, and warns about each.
+// Best-effort on every front: missing tools are skipped, and the scan cannot
+// express every rule form (e.g. ipset references), so it errs toward silence.
+// remediateForeignDropChains finds input-hook base chains with a drop policy
+// and inserts an accept for the listen port into each. This is the only
+// effective self-help against a hostile host firewall: netfilter has no
+// cross-chain exemption — an accept in any other chain never survives a
+// foreign chain's drop — so the rule must live in the blocking chain itself.
+// Inserted rules carry our comment (visible in `nft list ruleset`), are
+// tracked, and are removed on Close. Chains already carrying our tag are
+// left alone.
+func (r *linuxRouter) remediateForeignDropChains(log *log.Logger, port uint16) {
+	conn, err := nftables.New()
+	if err != nil {
+		return // no netlink access; nothing netfilter-side we can do here
 	}
-	return r.run("filter", "-I", "INPUT", "1", "-p", "udp", "--dport", fmt.Sprintf("%d", r.port), "-j", "ACCEPT")
+	chains, err := conn.ListChains()
+	if err != nil {
+		return
+	}
+	portBE := []byte{byte(port >> 8), byte(port)}
+	for _, chain := range chains {
+		if chain.Table == nil || chain.Hooknum == nil || chain.Policy == nil {
+			continue
+		}
+		if *chain.Hooknum != *nftables.ChainHookInput || *chain.Policy != nftables.ChainPolicyDrop {
+			continue
+		}
+		if r.chainHasOurRule(conn, chain) {
+			continue
+		}
+		conn.AddRule(&nftables.Rule{
+			Table: chain.Table,
+			Chain: chain,
+			Exprs: []expr.Any{
+				&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_UDP}},
+				&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
+				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: portBE},
+				&expr.Verdict{Kind: expr.VerdictAccept},
+			},
+			UserData: []byte(nftComment),
+		})
+		if err := conn.Flush(); err != nil {
+			log.Printf("router: could not open udp/%d in firewall %q chain %q: %v", port, chain.Table.Name, chain.Name, err)
+			continue
+		}
+		r.mu.Lock()
+		r.nftChains = append(r.nftChains, chain)
+		r.mu.Unlock()
+		log.Printf("router: opened udp/%d in firewall %q chain %q (its drop policy would have blocked it)", port, chain.Table.Name, chain.Name)
+	}
+}
+
+// chainHasOurRule reports whether the chain already carries a rule tagged
+// with our comment (a previous remediation pass).
+func (r *linuxRouter) chainHasOurRule(conn *nftables.Conn, chain *nftables.Chain) bool {
+	rules, err := conn.GetRules(chain.Table, chain)
+	if err != nil {
+		return false
+	}
+	for _, rule := range rules {
+		if string(rule.UserData) == nftComment {
+			return true
+		}
+	}
+	return false
+}
+
+// warnBlockedPort covers the legacy iptables family: chains there have no
+// independent name-spacing problem, and hosts meshd can fully serve are
+// handled by openPort already — but a DROP policy without our port is worth
+// shouting about. Best-effort: missing tools are skipped, and the scan cannot
+// express every rule form (e.g. ipset references), so it errs toward silence.
+func warnBlockedPort(log *log.Logger, port int) {
+	if log == nil {
+		return
+	}
+	pat := fmt.Sprintf("%d", port)
+	for _, tool := range []string{"iptables-save", "ip6tables-save"} {
+		if out, err := exec.Command(tool).CombinedOutput(); err == nil {
+			warnBlockedFromSave(log, tool, pat, string(out))
+		}
+	}
+}
+
+// mentionsPort reports whether a rule line references the port as a whole
+// field — covering "dport 51822" and set literals "{ 443, 21820, 51820 }"
+// while keeping 5182 from matching 51820.
+func mentionsPort(line, port string) bool {
+	for _, f := range strings.Fields(strings.Trim(line, "{}")) {
+		if strings.Trim(f, ",") == port {
+			return true
+		}
+	}
+	return false
+}
+
+func warnBlockedFromSave(log *log.Logger, tool, port, dump string) {
+	chain, policy := "", ""
+	var body []string
+	found := func() {
+		if chain == "" || policy != "DROP" {
+			return
+		}
+		for _, line := range body {
+			if mentionsPort(line, port) {
+				return
+			}
+		}
+		log.Printf("router: firewall %s chain %q has policy DROP and no rule for udp/%s — inbound handshakes will be dropped; add e.g. 'iptables -I INPUT -p udp --dport %s -j ACCEPT'", tool, chain, port, port)
+	}
+	for _, line := range strings.Split(dump, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, ":"):
+			found()
+			f := strings.Fields(strings.TrimPrefix(line, ":"))
+			// Only the INPUT chain binds the input hook — FORWARD/OUTPUT
+			// DROP policies are normal (docker sets them) and none of our
+			// business, so non-INPUT chains reset to untracked.
+			if len(f) >= 2 && f[0] == "INPUT" {
+				chain, policy, body = f[0], f[1], nil
+			} else {
+				chain, policy, body = "", "", nil
+			}
+		case strings.HasPrefix(line, "-A ") && strings.Fields(line)[1] == "INPUT":
+			body = append(body, line)
+		case strings.HasPrefix(line, "COMMIT"):
+			found()
+			chain, policy, body = "", "", nil
+		}
+	}
+	found()
+}
+
+// openPort inserts an INPUT accept for the UDP listen port in BOTH address
+// families. The tunnel payload is IPv4, but WireGuard's transport is
+// dual-stack and the daemon advertises IPv6 candidates — a family-specific
+// host firewall with a restrictive v6 policy would otherwise silently close
+// half the transport. ip6tables is used when available.
+func (r *linuxRouter) openPort() error {
+	port := fmt.Sprintf("%d", r.port)
+	probe := []string{"-C", "INPUT", "-p", "udp", "--dport", port, "-j", "ACCEPT"}
+	insert := []string{"-I", "INPUT", "1", "-p", "udp", "--dport", port, "-j", "ACCEPT"}
+	if err := r.run("filter", probe...); err != nil {
+		if err := r.run("filter", insert...); err != nil {
+			return err
+		}
+	}
+	if r.hasIP6 {
+		if err := r.run6("filter", probe...); err != nil {
+			if err := r.run6("filter", insert...); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // ipForwardPath is a package var so tests can point it at a temp file.
@@ -171,6 +360,32 @@ func (r *linuxRouter) Close() error {
 	if err := r.run("filter", "-D", "INPUT", "-p", "udp", "--dport", fmt.Sprintf("%d", r.port), "-j", "ACCEPT"); err != nil && first == nil {
 		first = err
 	}
+	if r.hasIP6 {
+		if err := r.run6("filter", "-D", "INPUT", "-p", "udp", "--dport", fmt.Sprintf("%d", r.port), "-j", "ACCEPT"); err != nil && first == nil {
+			first = err
+		}
+	}
+	if len(r.nftChains) > 0 {
+		if conn, err := nftables.New(); err == nil {
+			for _, ch := range r.nftChains {
+				rules, err := conn.GetRules(ch.Table, ch)
+				if err != nil {
+					continue
+				}
+				for _, rule := range rules {
+					if string(rule.UserData) == nftComment {
+						if err := conn.DelRule(rule); err != nil && first == nil {
+							first = fmt.Errorf("router: remove nft accept from %q chain %q: %w", ch.Table.Name, ch.Name, err)
+						}
+					}
+				}
+			}
+			if err := conn.Flush(); err != nil && first == nil {
+				first = fmt.Errorf("router: remove nft accepts: %w", err)
+			}
+		}
+	}
+	r.nftChains = nil
 	if r.fwdSet && r.priorFwd != "" {
 		if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte(r.priorFwd), 0o644); err != nil && first == nil {
 			first = err
@@ -181,9 +396,20 @@ func (r *linuxRouter) Close() error {
 
 func (r *linuxRouter) run(table string, args ...string) error {
 	full := append([]string{"-t", table}, args...)
-	cmd := exec.Command("iptables", full...)
+	cmd := exec.Command(iptablesBin, full...)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("iptables %s: %w (%s)", strings.Join(full, " "), err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("%s %s: %w (%s)", iptablesBin, strings.Join(full, " "), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// run6 mirrors run for the IPv6 family (transport-port rules only; the
+// overlay, routes, and masquerade are IPv4 by design).
+func (r *linuxRouter) run6(table string, args ...string) error {
+	full := append([]string{"-t", table}, args...)
+	cmd := exec.Command(ip6tablesBin, full...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%s %s: %w (%s)", ip6tablesBin, strings.Join(full, " "), err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

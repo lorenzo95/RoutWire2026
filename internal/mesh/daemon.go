@@ -212,13 +212,21 @@ func (dm *Daemon) Tick(ctx context.Context) error {
 		return err
 	}
 
+	for i := range plans {
+		plans[i].freshNow = time.Since(dm.dev.Handshake(plans[i].pub)) < dm.cfg.StaleAfter
+	}
 	state := make([]PeerDesire, 0, len(plans))
 	for i := range plans {
 		pickInitial(&plans[i])
+		if plans[i].freshNow {
+			// A live session owns its endpoint: WireGuard roams it to the
+			// source of authenticated traffic, and re-asserting our recorded
+			// value would clobber fresher roams (a stale winner pinned by an
+			// adoption or restart then blackholes the data path). Omit the
+			// endpoint entirely — wgctrl treats nil as "leave unchanged".
+			plans[i].desire.Endpoint = nil
+		}
 		state = append(state, plans[i].desire)
-	}
-	for i := range plans {
-		plans[i].freshNow = time.Since(dm.dev.Handshake(plans[i].pub)) < dm.cfg.StaleAfter
 	}
 	if err := dm.dev.Apply(state); err != nil {
 		return fmt.Errorf("apply: %w", err)
@@ -231,12 +239,13 @@ func (dm *Daemon) Tick(ctx context.Context) error {
 				// A live session we can't account for (daemon restart, or
 				// the peer roamed in on its own): adopt the kernel's tracked
 				// endpoint as the winner instead of re-racing — racing a
-				// working session only churns endpoints and log noise.
+				// working session only churns endpoints and log noise. The
+				// endpoint itself is NOT re-asserted (see above): the kernel
+				// owns it while the session lives.
 				if ep := dm.dev.Endpoint(p.pub); ep != nil && ep.IP != nil {
 					win := Candidate{Type: CandPRFLX, Addr: ep.String()}
 					dm.lastGood[p.name] = win
 					p.winner, p.haveWin = win, true
-					p.desire.Endpoint = ep
 					dm.log.Printf("peer %s: adopted live session via %s", p.name, win.Addr)
 				}
 			}

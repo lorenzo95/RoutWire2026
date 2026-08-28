@@ -56,8 +56,15 @@ see "Lab conventions" below. Unit tests cover the rest via fakes
    the hub derives each spoke's peer + masquerade from the name. Spoke records
    are never published to the DHT; non-hub nodes never see them.
 7. **Kernel state is owned by `Router`** (`router.go`): ip_forward, INPUT rule
-   for the UDP listen port, per-spoke MASQUERADE. Everything it adds is
-   removed on `Close()`; forwarding restores its prior value.
+   for the UDP listen port (both address families — WireGuard's transport is
+   dual-stack even though the overlay is v4), per-spoke MASQUERADE. Everything
+   it adds is removed on `Close()`; forwarding restores its prior value. The
+   router also self-heals hostile host firewalls: input-hook chains with a
+   drop policy lacking our port get an accept inserted (tagged via rule
+   userdata `routewire-meshd`, removed on `Close()`). Migration note: the
+   remaining iptables jobs are the spoke MASQUERADE and legacy-iptables-host
+   coverage; everything else already speaks netlink via google/nftables —
+   see router.go before removing the iptables dependency.
 8. **Subcommand parsing**: `expandSubcommand` finds a subcommand token anywhere
    in argv (so `meshd -config f.yaml peek` works) but skips flag *values* —
    add new value-taking flags to `valueFlags`.
