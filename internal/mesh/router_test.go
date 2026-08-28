@@ -193,7 +193,7 @@ func TestRouterRemediatesForeignDropChainLive(t *testing.T) {
 	l, printed := captureLog(t)
 	r := &linuxRouter{iface: "wgtest0", port: 51999, added: map[string]bool{}, hasIP6: false}
 	r.remediateForeignDropChains(l, 51999)
-	if len(r.nftChains) == 0 {
+	if len(r.taggedChains) == 0 {
 		t.Fatalf("drop-policy chain lacking our port must be remediated, log: %s", printed())
 	}
 
@@ -226,6 +226,78 @@ func TestRouterRemediatesForeignDropChainLive(t *testing.T) {
 	for _, rule := range rules {
 		if string(rule.UserData) == nftComment {
 			t.Fatal("close must remove our remediation rule")
+		}
+	}
+}
+
+// Forward-hook variant: a drop-policy forward chain gets the tagged
+// iifname/oifname pair when the router enables forwarding, and Close
+// removes them. Same atomic-safety trick as the input test.
+func TestRouterRemediatesForwardChainLive(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root for netlink")
+	}
+	conn, err := nftables.New()
+	if err != nil {
+		t.Skipf("no netlink: %v", err)
+	}
+	hook, prio, policy := *nftables.ChainHookForward, *nftables.ChainPriorityFilter, nftables.ChainPolicyDrop
+	tbl := &nftables.Table{Name: "routewire-fwdtest", Family: nftables.TableFamilyINet}
+	ch := &nftables.Chain{
+		Name: "forward", Table: tbl,
+		Hooknum: &hook, Priority: &prio, Policy: &policy,
+		Type: nftables.ChainTypeFilter,
+	}
+	conn.AddTable(tbl)
+	conn.AddChain(ch)
+	conn.AddRule(&nftables.Rule{Table: tbl, Chain: ch, Exprs: []expr.Any{
+		&expr.Verdict{Kind: expr.VerdictAccept},
+	}})
+	if err := conn.Flush(); err != nil {
+		t.Skipf("cannot create test chain: %v", err)
+	}
+	defer func() {
+		c, err := nftables.New()
+		if err == nil {
+			c.DelTable(tbl)
+			c.Flush()
+		}
+	}()
+
+	l, printed := captureLog(t)
+	r := &linuxRouter{iface: "rwtest0", port: 51999, added: map[string]bool{}, hasIP6: false, log: l}
+	if err := r.Forwarding(); err != nil {
+		t.Fatalf("forwarding: %v", err)
+	}
+	if len(r.taggedChains) == 0 {
+		t.Fatalf("drop-policy forward chain must be remediated, log: %s", printed())
+	}
+	rules, err := conn.GetRules(tbl, ch)
+	if err != nil {
+		t.Fatalf("get rules: %v", err)
+	}
+	tagged := 0
+	for _, rule := range rules {
+		if string(rule.UserData) == nftComment {
+			tagged++
+		}
+	}
+	if tagged != 2 {
+		t.Fatalf("want iifname+oifname tagged rules, got %d", tagged)
+	}
+	if out := printed(); !strings.Contains(out, "opened forwarding for") {
+		t.Fatalf("successful forward remediation must be logged, got: %s", out)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	rules, err = conn.GetRules(tbl, ch)
+	if err != nil {
+		t.Fatalf("get rules after close: %v", err)
+	}
+	for _, rule := range rules {
+		if string(rule.UserData) == nftComment {
+			t.Fatal("close must remove the forward remediation rules")
 		}
 	}
 }

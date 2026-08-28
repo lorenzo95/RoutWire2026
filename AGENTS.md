@@ -59,7 +59,8 @@ see "Lab conventions" below. Unit tests cover the rest via fakes
    for the UDP listen port (both address families — WireGuard's transport is
    dual-stack even though the overlay is v4), per-spoke MASQUERADE. Everything
    it adds is removed on `Close()`; forwarding restores its prior value. The
-   router also self-heals hostile host firewalls: input-hook chains with a
+   router also self-heals hostile host firewalls: input-hook and (when serving
+   spokes or announcements) forward-hook chains with a
    drop policy lacking our port get an accept inserted (tagged via rule
    userdata `routewire-meshd`, removed on `Close()`). Migration note: the
    remaining iptables jobs are the spoke MASQUERADE and legacy-iptables-host

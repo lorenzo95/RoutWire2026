@@ -62,12 +62,14 @@ var (
 type linuxRouter struct {
 	iface    string
 	port     int
+	log      *log.Logger
 	mu       sync.Mutex
 	added    map[string]bool
 	fwdSet   bool
+	fwdFixed bool
 	priorFwd string
 	hasIP6   bool
-	nftChains []*nftables.Chain
+	taggedChains []*nftables.Chain
 }
 
 // nftRule is an accept we inserted into a foreign input-hook chain that would
@@ -97,6 +99,7 @@ func NewLinuxRouter(iface string, port int, log *log.Logger) (Router, error) {
 	r := &linuxRouter{
 		iface:    iface,
 		port:     port,
+		log:      log,
 		added:    make(map[string]bool),
 		priorFwd: strings.TrimSpace(string(prior)),
 	}
@@ -148,10 +151,21 @@ func (r *linuxRouter) remediateForeignDropChains(log *log.Logger, port uint16) {
 		if *chain.Hooknum != *nftables.ChainHookInput || *chain.Policy != nftables.ChainPolicyDrop {
 			continue
 		}
-		if r.chainHasOurRule(conn, chain) {
+		rules, err := conn.GetRules(chain.Table, chain)
+		if err != nil {
 			continue
 		}
-		conn.AddRule(&nftables.Rule{
+		tagged := false
+		for _, rule := range rules {
+			if string(rule.UserData) == nftComment {
+				tagged = true
+				break
+			}
+		}
+		if tagged {
+			continue
+		}
+		nr := &nftables.Rule{
 			Table: chain.Table,
 			Chain: chain,
 			Exprs: []expr.Any{
@@ -162,31 +176,25 @@ func (r *linuxRouter) remediateForeignDropChains(log *log.Logger, port uint16) {
 				&expr.Verdict{Kind: expr.VerdictAccept},
 			},
 			UserData: []byte(nftComment),
-		})
+		}
+		// Insert at the TOP of the chain: an appended accept can sit after a
+		// foreign terminal drop and never be reached. The kernel positions an
+		// insert by rule HANDLE (position 0 does not exist), so anchor on the
+		// first rule; a ruleless chain takes a plain append.
+		if len(rules) > 0 {
+			nr.Position = rules[0].Handle
+			nr.Flags = 1 << unix.NFTA_RULE_POSITION
+		}
+		conn.AddRule(nr)
 		if err := conn.Flush(); err != nil {
 			log.Printf("router: could not open udp/%d in firewall %q chain %q: %v", port, chain.Table.Name, chain.Name, err)
 			continue
 		}
 		r.mu.Lock()
-		r.nftChains = append(r.nftChains, chain)
+		r.taggedChains = append(r.taggedChains, chain)
 		r.mu.Unlock()
 		log.Printf("router: opened udp/%d in firewall %q chain %q (its drop policy would have blocked it)", port, chain.Table.Name, chain.Name)
 	}
-}
-
-// chainHasOurRule reports whether the chain already carries a rule tagged
-// with our comment (a previous remediation pass).
-func (r *linuxRouter) chainHasOurRule(conn *nftables.Conn, chain *nftables.Chain) bool {
-	rules, err := conn.GetRules(chain.Table, chain)
-	if err != nil {
-		return false
-	}
-	for _, rule := range rules {
-		if string(rule.UserData) == nftComment {
-			return true
-		}
-	}
-	return false
 }
 
 // warnBlockedPort covers the legacy iptables family: chains there have no
@@ -294,13 +302,157 @@ func (r *linuxRouter) Forwarding() error {
 	// read-only /proc/sys mount.
 	if b, err := os.ReadFile(ipForwardPath); err == nil && strings.TrimSpace(string(b)) == "1" {
 		r.fwdSet = true
-		return nil
+	} else {
+		if err := os.WriteFile(ipForwardPath, []byte("1"), 0o644); err != nil {
+			return fmt.Errorf("router: enable ip_forward: %w", err)
+		}
+		r.fwdSet = true
 	}
-	if err := os.WriteFile(ipForwardPath, []byte("1"), 0o644); err != nil {
-		return fmt.Errorf("router: enable ip_forward: %w", err)
-	}
-	r.fwdSet = true
+	// Forwarding is only requested when the node serves spokes or announced
+	// subnets — exactly when host firewalls with drop-policies on the forward
+	// hook would silently break spoke routing. Same self-heal as the input
+	// hook: insert tagged accepts into every drop-policy forward chain.
+	r.remediateForwardChains()
 	return nil
+}
+
+// remediateForwardChains inserts tagged accepts for the mesh interface into
+// every forward-hook base chain with a drop policy, in every family — spoke
+// traffic enters and leaves through the mesh interface, so the pair covers
+// both directions. Idempotent via the userdata tag; legacy iptables-family
+// hosts get a warning instead (their rules live in a separate database the
+// library cannot reach). Caller must hold r.mu (called from Forwarding).
+func (r *linuxRouter) remediateForwardChains() {
+	if r.fwdFixed {
+		return
+	}
+	r.fwdFixed = true
+	conn, err := nftables.New()
+	if err != nil {
+		r.warnLegacyForward()
+		return
+	}
+	chains, err := conn.ListChains()
+	if err != nil {
+		r.warnLegacyForward()
+		return
+	}
+	inserted := 0
+	for _, chain := range chains {
+		if chain.Table == nil || chain.Hooknum == nil {
+			continue
+		}
+		// Every forward-hook base chain is patched regardless of its policy:
+		// docker's layout keeps policy accept but hides a terminal DROP
+		// inside DOCKER-FORWARD, which an appended rule can never outrun.
+		if *chain.Hooknum != *nftables.ChainHookForward {
+			continue
+		}
+		rules, err := conn.GetRules(chain.Table, chain)
+		if err != nil {
+			continue
+		}
+		tagged := false
+		for _, rule := range rules {
+			if string(rule.UserData) == nftComment {
+				tagged = true
+				break
+			}
+		}
+		if tagged {
+			continue
+		}
+		mkrule := func(metaKey expr.MetaKey) *nftables.Rule {
+			nr := &nftables.Rule{
+				Table: chain.Table,
+				Chain: chain,
+				Exprs: []expr.Any{
+					&expr.Meta{Key: metaKey, Register: 1},
+					&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifnameBytes(r.iface)},
+					&expr.Verdict{Kind: expr.VerdictAccept},
+				},
+				UserData: []byte(nftComment),
+			}
+			// Insert at the TOP of the chain, ahead of docker's jumps and
+			// any foreign terminal drops. The kernel positions an insert by
+			// rule HANDLE (position 0 does not exist), so anchor on the
+			// first rule; a ruleless chain takes a plain append.
+			if len(rules) > 0 {
+				nr.Position = rules[0].Handle
+				nr.Flags = 1 << unix.NFTA_RULE_POSITION
+			}
+			return nr
+		}
+		conn.AddRule(mkrule(expr.MetaKeyIIFNAME))
+		conn.AddRule(mkrule(expr.MetaKeyOIFNAME))
+		if err := conn.Flush(); err != nil {
+			if r.log != nil {
+				r.log.Printf("router: could not open forwarding for %q in firewall %q chain %q: %v", r.iface, chain.Table.Name, chain.Name, err)
+			}
+			continue
+		}
+		r.taggedChains = append(r.taggedChains, chain)
+		inserted++
+		if r.log != nil {
+			r.log.Printf("router: opened forwarding for %q in firewall %q chain %q (foreign rules would have blocked it)", r.iface, chain.Table.Name, chain.Name)
+		}
+	}
+	if inserted == 0 {
+		r.warnLegacyForward()
+	}
+}
+
+// warnLegacyForward covers hosts whose filtering runs in the iptables-legacy
+// database, which netlink nft calls cannot reach.
+func (r *linuxRouter) warnLegacyForward() {
+	for _, tool := range []string{"iptables-save", "ip6tables-save"} {
+		out, err := exec.Command(tool).CombinedOutput()
+		if err != nil {
+			continue
+		}
+		chain, policy := "", ""
+		var body []string
+		found := func() {
+			if chain == "" || policy != "DROP" {
+				return
+			}
+			for _, line := range body {
+				if strings.Contains(line, "-i "+r.iface) || strings.Contains(line, "-o "+r.iface) {
+					return
+				}
+			}
+			if r.log != nil {
+				r.log.Printf("router: firewall %s chain %q has policy DROP and no rule for %q — spoke routing will be dropped; add e.g. 'iptables -I FORWARD -i %s -j ACCEPT'", tool, chain, r.iface, r.iface)
+			}
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			line = strings.TrimSpace(line)
+			switch {
+			case strings.HasPrefix(line, ":"):
+				found()
+				f := strings.Fields(strings.TrimPrefix(line, ":"))
+				if len(f) >= 2 && f[0] == "FORWARD" {
+					chain, policy, body = f[0], f[1], nil
+				} else {
+					chain, policy, body = "", "", nil
+				}
+			case strings.HasPrefix(line, "-A ") && strings.Fields(line)[1] == "FORWARD":
+				body = append(body, line)
+			case strings.HasPrefix(line, "COMMIT"):
+				found()
+				chain, policy, body = "", "", nil
+			}
+		}
+		found()
+	}
+}
+
+// ifnameBytes renders an interface name the way nft compares iifname/oifname:
+// NUL-padded to IFNAMSIZ.
+func ifnameBytes(name string) []byte {
+	b := make([]byte, 16)
+	copy(b, name)
+	return b
 }
 
 func (r *linuxRouter) AddSource(spoke net.IP) error {
@@ -365,9 +517,9 @@ func (r *linuxRouter) Close() error {
 			first = err
 		}
 	}
-	if len(r.nftChains) > 0 {
+	if len(r.taggedChains) > 0 {
 		if conn, err := nftables.New(); err == nil {
-			for _, ch := range r.nftChains {
+			for _, ch := range r.taggedChains {
 				rules, err := conn.GetRules(ch.Table, ch)
 				if err != nil {
 					continue
@@ -385,7 +537,7 @@ func (r *linuxRouter) Close() error {
 			}
 		}
 	}
-	r.nftChains = nil
+	r.taggedChains = nil
 	if r.fwdSet && r.priorFwd != "" {
 		if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte(r.priorFwd), 0o644); err != nil && first == nil {
 			first = err
