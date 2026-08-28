@@ -361,6 +361,32 @@ func TestMentionsPortWholeField(t *testing.T) {
 	}
 }
 
+// meshd stop runs without the daemon's tracking: CleanupFirewall must remove
+// the port accepts, spoke masquerades, and announce masquerades driven purely
+// by the resolved config.
+func TestCleanupFirewallRemovesAllTraces(t *testing.T) {
+	logFile := shimBinaries(t, false)
+	l, _ := captureLog(t)
+
+	_, overlay, _ := net.ParseCIDR("10.99.0.0/16")
+	_, lan, _ := net.ParseCIDR("192.168.1.0/24")
+	spokeIP := net.ParseIP("10.99.9.12")
+
+	CleanupFirewall(l, "wgtest0", 51822, overlay, []net.IPNet{*lan}, []net.IP{spokeIP})
+
+	b, _ := os.ReadFile(logFile)
+	calls := string(b)
+	for _, want := range []string{
+		"-D INPUT -p udp --dport 51822 -j ACCEPT",
+		"-D POSTROUTING -s 10.99.9.12/32 -o wgtest0 -j MASQUERADE",
+		"-D POSTROUTING -s 10.99.0.0/16 -d 192.168.1.0/24 -j MASQUERADE",
+	} {
+		if !strings.Contains(calls, want) {
+			t.Fatalf("cleanup must remove %q, calls:\n%s", want, calls)
+		}
+	}
+}
+
 // AnnounceNAT reconciles masquerade rules for announced subnets: adds new,
 // removes dropped, idempotent across ticks, and Close removes everything.
 func TestAnnounceNATReconciles(t *testing.T) {

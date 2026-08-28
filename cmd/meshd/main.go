@@ -204,6 +204,19 @@ run 'meshd -h' for every flag and subcommand.
 	}
 
 	if *stopF {
+		// The stop process has no in-memory tracking, so firewall cleanup is
+		// driven by the resolved config plus the userdata tag: port accepts,
+		// spoke + announce masquerades, and tagged self-heal rules in foreign
+		// chains. The interface goes last.
+		spokeIPs := []net.IP{}
+		if names, err := mesh.LoadSpokes(spokesPath); err == nil {
+			for name := range names {
+				if ip, err := deriver.OverlayIP(name, cidrNet); err == nil {
+					spokeIPs = append(spokeIPs, ip)
+				}
+			}
+		}
+		mesh.CleanupFirewall(logger, resolved.IFace, resolved.Port, cidrNet, mesh.ParseCIDRs(resolved.Announce), spokeIPs)
 		if err := stopInterface(resolved.IFace); err != nil {
 			fatalf("stop: %v", err)
 		}

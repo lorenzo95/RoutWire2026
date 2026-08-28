@@ -463,6 +463,75 @@ func ifnameBytes(name string) []byte {
 	return b
 }
 
+// CleanupFirewall removes every firewall trace of a meshd run: the
+// transport-port accepts (both families), per-spoke masquerades, announce
+// masquerades, and the tagged self-heal rules inside foreign chains.
+// Intended for `meshd stop`, which runs without the daemon's in-memory
+// tracking — removal is driven by the resolved config plus the userdata
+// tag. Best-effort: absent rules and unreachable tools are skipped.
+func CleanupFirewall(log *log.Logger, iface string, port int, overlay *net.IPNet, announce []net.IPNet, spokeIPs []net.IP) {
+	// Transport-port accepts, both families.
+	for _, fam := range []string{iptablesBin, ip6tablesBin} {
+		args := []string{"-D", "INPUT", "-p", "udp", "--dport", fmt.Sprintf("%d", port), "-j", "ACCEPT"}
+		if out, err := exec.Command(fam, args...).CombinedOutput(); err != nil && log != nil {
+			log.Printf("router cleanup: %s %s: %v (%s)", fam, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		}
+	}
+	// Per-spoke masquerades.
+	for _, ip := range spokeIPs {
+		if ip4 := ip.To4(); ip4 != nil {
+			args := []string{"-t", "nat", "-D", "POSTROUTING", "-s", ip4.String() + "/32", "-o", iface, "-j", "MASQUERADE"}
+			if _, err := exec.Command(iptablesBin, args...).CombinedOutput(); err != nil && log != nil {
+				log.Printf("router cleanup: iptables %s: %v", strings.Join(args, " "), err)
+			}
+		}
+	}
+	// Announce masquerades.
+	if overlay != nil {
+		for _, sub := range announce {
+			if sub.IP.To4() == nil {
+				continue
+			}
+			args := []string{"-t", "nat", "-D", "POSTROUTING", "-s", overlay.String(), "-d", sub.String(), "-j", "MASQUERADE"}
+			if _, err := exec.Command(iptablesBin, args...).CombinedOutput(); err != nil && log != nil {
+				log.Printf("router cleanup: iptables %s: %v", strings.Join(args, " "), err)
+			}
+		}
+	}
+	// Tagged self-heal rules across every nft chain (input + forward, both
+	// families) — these live in foreign chains, so the userdata tag is the
+	// only reliable way to find them.
+	conn, err := nftables.New()
+	if err != nil {
+		return
+	}
+	chains, err := conn.ListChains()
+	if err != nil {
+		return
+	}
+	flush := false
+	for _, chain := range chains {
+		rules, err := conn.GetRules(chain.Table, chain)
+		if err != nil {
+			continue
+		}
+		for _, rule := range rules {
+			if string(rule.UserData) != nftComment {
+				continue
+			}
+			if err := conn.DelRule(rule); err == nil {
+				flush = true
+				if log != nil {
+					log.Printf("router cleanup: removed tagged rule from %q chain %q", chain.Table.Name, chain.Name)
+				}
+			}
+		}
+	}
+	if flush {
+		_ = conn.Flush()
+	}
+}
+
 func (r *linuxRouter) AddSource(spoke net.IP) error {
 	ip4 := spoke.To4()
 	if ip4 == nil {
