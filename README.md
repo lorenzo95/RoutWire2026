@@ -63,6 +63,18 @@ sudo docker run -d --name meshd --restart unless-stopped \
   ghcr.io/lorenzo95/routewire2026 -config /etc/meshd/meshd.yaml
 ```
 
+**Lifecycle cheat-sheet** (who cleans up what):
+
+| Action | Use | Firewall state |
+|---|---|---|
+| change config (announce on/off, etc.) | edit config → `sudo docker restart meshd` | reconciled by the daemon itself |
+| remove the node | `sudo docker stop meshd && sudo docker rm meshd` | cleaned by the daemon's graceful shutdown |
+| clean up leftovers (daemon already gone) | `… -stop` (one-off container, as above) | config-driven sweep + interface delete |
+
+`-stop` is a recovery tool for when no daemon is running — never run it against
+a live `meshd` container (it deletes the interface out from under it).
+
+```
 Within ~45s both nodes find each other and the overlay is encrypted (verify with
 `meshd peek`, or `ping` the peer's overlay address shown by `init`). The run
 commands are identical on every node — only the `init` differs (first node

@@ -55,7 +55,7 @@ func main() {
 	var (
 		configF = flag.String("config", "", "config file path (.yaml or .json)")
 
-		stopF   = flag.Bool("stop", false, "delete interface and exit")
+		stopF   = flag.Bool("stop", false, "remove this node entirely: interface + firewall state (run only when no meshd daemon is active)")
 		exportF = flag.Bool("export", false, "generate a wg-quick config for -remote and exit")
 		initF   = flag.Bool("init", false, "write a starter config file (-out path, default meshd.yaml) and exit")
 		peekF   = flag.Bool("peek", false, "fetch the live DHT roster, verify records, print them; no interface needed")
