@@ -57,11 +57,11 @@ type Router interface {
 // noopRouter is used when routing integration is disabled (dry-run, tests).
 type noopRouter struct{}
 
-func (noopRouter) Forwarding() error         { return nil }
-func (noopRouter) AddSource(net.IP) error    { return nil }
-func (noopRouter) RemoveSource(net.IP) error { return nil }
+func (noopRouter) Forwarding() error                         { return nil }
+func (noopRouter) AddSource(net.IP) error                    { return nil }
+func (noopRouter) RemoveSource(net.IP) error                 { return nil }
 func (noopRouter) AnnounceNAT(*net.IPNet, []net.IPNet) error { return nil }
-func (noopRouter) Close() error              { return nil }
+func (noopRouter) Close() error                              { return nil }
 
 // Package-level binary names so tests can shim them via PATH.
 var (
@@ -81,6 +81,7 @@ type linuxRouter struct {
 	fwdFixed     bool
 	priorFwd     string
 	hasIP6       bool
+	selfheal     bool
 	taggedChains []*nftables.Chain
 }
 
@@ -94,7 +95,7 @@ type linuxRouter struct {
 // about foreign firewalls: chains that would drop the listen port get an
 // accept inserted (tracked, removed on Close); chains meshd cannot open are
 // reported as warnings.
-func NewLinuxRouter(iface string, port int, log *log.Logger) (Router, error) {
+func NewLinuxRouter(iface string, port int, selfheal bool, log *log.Logger) (Router, error) {
 	if iface == "" {
 		return nil, fmt.Errorf("router: empty iface")
 	}
@@ -113,6 +114,7 @@ func NewLinuxRouter(iface string, port int, log *log.Logger) (Router, error) {
 		port:        port,
 		log:         log,
 		added:       make(map[string]bool),
+		selfheal:    selfheal,
 		announceNAT: make(map[string]string),
 		priorFwd:    strings.TrimSpace(string(prior)),
 	}
@@ -122,7 +124,11 @@ func NewLinuxRouter(iface string, port int, log *log.Logger) (Router, error) {
 	if err := r.openPort(); err != nil {
 		return nil, fmt.Errorf("router: open port: %w", err)
 	}
-	r.remediateForeignDropChains(log, uint16(port))
+	if r.selfheal {
+		r.applyInputSelfHeal(log, uint16(port))
+	} else {
+		r.warnBlockedInputNft(log, uint16(port))
+	}
 	warnBlockedPort(log, port)
 	return r, nil
 }
@@ -147,7 +153,7 @@ func NewLinuxRouter(iface string, port int, log *log.Logger) (Router, error) {
 // Inserted rules carry our comment (visible in `nft list ruleset`), are
 // tracked, and are removed on Close. Chains already carrying our tag are
 // left alone.
-func (r *linuxRouter) remediateForeignDropChains(log *log.Logger, port uint16) {
+func (r *linuxRouter) applyInputSelfHeal(log *log.Logger, port uint16) {
 	conn, err := nftables.New()
 	if err != nil {
 		return // no netlink access; nothing netfilter-side we can do here
@@ -210,6 +216,50 @@ func (r *linuxRouter) remediateForeignDropChains(log *log.Logger, port uint16) {
 	}
 }
 
+// warnBlockedInputNft reports (warn-only builds) input-hook chains whose
+// drop policy lacks the listen port.
+func (r *linuxRouter) warnBlockedInputNft(log *log.Logger, port uint16) {
+	conn, err := nftables.New()
+	if err != nil {
+		return
+	}
+	chains, err := conn.ListChains()
+	if err != nil {
+		return
+	}
+	portBE := []byte{byte(port >> 8), byte(port)}
+	for _, chain := range chains {
+		if chain.Table == nil || chain.Hooknum == nil || chain.Policy == nil {
+			continue
+		}
+		if *chain.Hooknum != *nftables.ChainHookInput || *chain.Policy != nftables.ChainPolicyDrop {
+			continue
+		}
+		blocked := true
+		rules, err := conn.GetRules(chain.Table, chain)
+		if err == nil {
+			for _, rule := range rules {
+				for _, e := range rule.Exprs {
+					if c, ok := e.(*expr.Cmp); ok && string(c.Data) == string(portBE) {
+						blocked = false
+						break
+					}
+				}
+				if !blocked {
+					break
+				}
+			}
+		}
+		if blocked && log != nil {
+			log.Printf("router: firewall %q chain %q would drop udp/%d — enable firewall_selfheal or add 'udp dport %d accept' to that chain", chain.Table.Name, chain.Name, port, port)
+		}
+	}
+}
+
+// warnBlockedPort covers the legacy iptables family: chains there have no
+// independent name-spacing problem, and hosts meshd can fully serve are
+// handled by openPort already — but a DROP policy without our port is worth
+// shouting about. Best-effort: missing tools are skipped, and the scan cannot
 // warnBlockedPort covers the legacy iptables family: chains there have no
 // independent name-spacing problem, and hosts meshd can fully serve are
 // handled by openPort already — but a DROP policy without our port is worth
@@ -325,7 +375,12 @@ func (r *linuxRouter) Forwarding() error {
 	// subnets — exactly when host firewalls with drop-policies on the forward
 	// hook would silently break spoke routing. Same self-heal as the input
 	// hook: insert tagged accepts into every drop-policy forward chain.
-	r.remediateForwardChains()
+	if r.selfheal {
+		r.applyForwardSelfHeal()
+	} else {
+		r.warnForwardNft()
+		r.warnLegacyForward()
+	}
 	return nil
 }
 
@@ -335,7 +390,10 @@ func (r *linuxRouter) Forwarding() error {
 // both directions. Idempotent via the userdata tag; legacy iptables-family
 // hosts get a warning instead (their rules live in a separate database the
 // library cannot reach). Caller must hold r.mu (called from Forwarding).
-func (r *linuxRouter) remediateForwardChains() {
+// applyForwardSelfHeal handles forward-hook base chains with a drop policy
+// that would break spoke/announce routing. Self-heal builds insert tagged
+// iifname+oifname accepts at the top of the chain; warn builds only report.
+func (r *linuxRouter) applyForwardSelfHeal() {
 	if r.fwdFixed {
 		return
 	}
@@ -352,13 +410,13 @@ func (r *linuxRouter) remediateForwardChains() {
 	}
 	inserted := 0
 	for _, chain := range chains {
-		if chain.Table == nil || chain.Hooknum == nil {
+		if chain.Table == nil || chain.Hooknum == nil || chain.Policy == nil {
 			continue
 		}
-		// Every forward-hook base chain is patched regardless of its policy:
-		// docker's layout keeps policy accept but hides a terminal DROP
-		// inside DOCKER-FORWARD, which an appended rule can never outrun.
-		if *chain.Hooknum != *nftables.ChainHookForward {
+		// Only drop-policy chains: permissive forward chains do not need
+		// help, and patching them was invasive on routers with deliberate
+		// forward policies.
+		if *chain.Hooknum != *nftables.ChainHookForward || *chain.Policy != nftables.ChainPolicyDrop {
 			continue
 		}
 		rules, err := conn.GetRules(chain.Table, chain)
@@ -386,10 +444,10 @@ func (r *linuxRouter) remediateForwardChains() {
 				},
 				UserData: []byte(nftComment),
 			}
-			// Insert at the TOP of the chain, ahead of docker's jumps and
-			// any foreign terminal drops. The kernel positions an insert by
-			// rule HANDLE (position 0 does not exist), so anchor on the
-			// first rule; a ruleless chain takes a plain append.
+			// Top of the chain, ahead of docker's jumps and any foreign
+			// terminal drops — anchored on the first rule's handle (the
+			// kernel positions inserts by handle; position 0 does not
+			// exist). A ruleless chain takes a plain append.
 			if len(rules) > 0 {
 				nr.Position = rules[0].Handle
 				nr.Flags = 1 << unix.NFTA_RULE_POSITION
@@ -404,14 +462,57 @@ func (r *linuxRouter) remediateForwardChains() {
 			}
 			continue
 		}
+		r.mu.Lock()
 		r.taggedChains = append(r.taggedChains, chain)
+		r.mu.Unlock()
 		inserted++
 		if r.log != nil {
-			r.log.Printf("router: opened forwarding for %q in firewall %q chain %q (foreign rules would have blocked it)", r.iface, chain.Table.Name, chain.Name)
+			r.log.Printf("router: opened forwarding for %q in firewall %q chain %q (its drop policy would have blocked it)", r.iface, chain.Table.Name, chain.Name)
 		}
 	}
 	if inserted == 0 {
 		r.warnLegacyForward()
+	}
+}
+
+// warnForwardNft reports (warn-only builds) forward-hook chains whose drop
+// policy lacks an accept for the mesh interface.
+func (r *linuxRouter) warnForwardNft() {
+	conn, err := nftables.New()
+	if err != nil {
+		return
+	}
+	chains, err := conn.ListChains()
+	if err != nil {
+		return
+	}
+	iface := ifnameBytes(r.iface)
+	for _, chain := range chains {
+		if chain.Table == nil || chain.Hooknum == nil || chain.Policy == nil {
+			continue
+		}
+		if *chain.Hooknum != *nftables.ChainHookForward || *chain.Policy != nftables.ChainPolicyDrop {
+			continue
+		}
+		rules, err := conn.GetRules(chain.Table, chain)
+		if err != nil {
+			continue
+		}
+		allowed := false
+		for _, rule := range rules {
+			for _, e := range rule.Exprs {
+				if c, ok := e.(*expr.Cmp); ok && string(c.Data) == string(iface) {
+					allowed = true
+					break
+				}
+			}
+			if allowed {
+				break
+			}
+		}
+		if !allowed && r.log != nil {
+			r.log.Printf("router: firewall %q chain %q has a drop policy — spoke routing needs 'iifname %s accept' + 'oifname %s accept' in that chain (or enable firewall_selfheal)", chain.Table.Name, chain.Name, r.iface, r.iface)
+		}
 	}
 }
 

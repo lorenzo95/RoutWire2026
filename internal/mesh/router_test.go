@@ -77,7 +77,7 @@ func TestNewLinuxRouterWithoutIptables(t *testing.T) {
 	if _, err := exec.LookPath("iptables"); err == nil {
 		t.Skip("iptables present; nothing to test")
 	}
-	_, err := NewLinuxRouter("wgtest0", 51820, nil)
+	_, err := NewLinuxRouter("wgtest0", 51820, false, nil)
 	if !errors.Is(err, ErrNoIptables) {
 		t.Fatalf("want ErrNoIptables, got %v", err)
 	}
@@ -192,8 +192,8 @@ func TestRouterRemediatesForeignDropChainLive(t *testing.T) {
 	}()
 
 	l, printed := captureLog(t)
-	r := &linuxRouter{iface: "wgtest0", port: 51999, added: map[string]bool{}, hasIP6: false}
-	r.remediateForeignDropChains(l, 51999)
+	r := &linuxRouter{iface: "wgtest0", port: 51999, added: map[string]bool{}, hasIP6: false, selfheal: true}
+	r.applyInputSelfHeal(l, 51999)
 	if len(r.taggedChains) == 0 {
 		t.Fatalf("drop-policy chain lacking our port must be remediated, log: %s", printed())
 	}
@@ -266,7 +266,7 @@ func TestRouterRemediatesForwardChainLive(t *testing.T) {
 	}()
 
 	l, printed := captureLog(t)
-	r := &linuxRouter{iface: "rwtest0", port: 51999, added: map[string]bool{}, hasIP6: false, log: l}
+	r := &linuxRouter{iface: "rwtest0", port: 51999, added: map[string]bool{}, hasIP6: false, selfheal: true, log: l}
 	if err := r.Forwarding(); err != nil {
 		t.Fatalf("forwarding: %v", err)
 	}

@@ -23,6 +23,7 @@ type MeshConfig struct {
 	Backend  string   `yaml:"backend,omitempty"`
 	Announce []string `yaml:"announce,omitempty"`
 	DryRun   bool     `yaml:"dry_run,omitempty"`
+	FirewallSelfHeal bool `yaml:"firewall_selfheal,omitempty"`
 }
 
 // LoadMeshConfig reads a config file strictly (must exist and parse).

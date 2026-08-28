@@ -236,7 +236,7 @@ run 'meshd -h' for every flag and subcommand.
 		if err != nil {
 			fatalf("device: %v", err)
 		}
-		rtr, err := mesh.NewLinuxRouter(resolved.IFace, resolved.Port, logger)
+		rtr, err := mesh.NewLinuxRouter(resolved.IFace, resolved.Port, resolved.FirewallSelfHeal, logger)
 		switch {
 		case errors.Is(err, mesh.ErrNoIptables):
 			logger.Printf("warning: %v — port/forwarding/NAT management disabled; handle on the host", err)
@@ -606,6 +606,7 @@ func renderConfigYAML(rc *config.MeshConfig) []byte {
 	writeList("announce", "extra subnets THIS node serves to the mesh", rc.Announce)
 
 	fmt.Fprintf(&b, "\n# simulate device control without touching the kernel\ndry_run: %t\n", rc.DryRun)
+	fmt.Fprintf(&b, "# insert accepts into host firewalls with drop policies (off = warn only)\nfirewall_selfheal: %t\n", rc.FirewallSelfHeal)
 	return []byte(b.String())
 }
 
