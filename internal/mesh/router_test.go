@@ -467,6 +467,12 @@ func TestAnnounceNATReconciles(t *testing.T) {
 	if got := strings.Count(string(b), "-s 10.99.0.0/16 -d 192.168.1.0/24"); got != 1 {
 		t.Fatalf("want exactly one masquerade rule per announcement, got %d:\n%s", got, b)
 	}
+	// The inserted rule MUST carry the meshd comment tag — untagged rules are
+	// invisible to the stop-time sweep (a lost tag shipped once and left
+	// orphaned masquerades behind).
+	if !strings.Contains(string(b), "-m comment --comment routewire-meshd") {
+		t.Fatalf("announce masquerade rules must be tagged for stop-cleanup:\n%s", b)
+	}
 
 	// Add a second announcement, drop the first: only the second remains.
 	if err := r.AnnounceNAT(overlay, []net.IPNet{*lan2}); err != nil {
