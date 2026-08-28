@@ -387,6 +387,27 @@ func TestCleanupFirewallRemovesAllTraces(t *testing.T) {
 	}
 }
 
+// Re-running stop against an already-clean host is a silent no-op: absent
+// rules delete-fail, the -C probe confirms absence, and nothing warns.
+func TestCleanupFirewallIdempotentWhenRulesAbsent(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\ncase \"$*\" in *\"-D \"*|*\"-C \"*) exit 1;; esac\nexit 0\n"
+	for _, name := range []string{iptablesBin, ip6tablesBin} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir)
+	l, printed := captureLog(t)
+
+	_, overlay, _ := net.ParseCIDR("10.99.0.0/16")
+	CleanupFirewall(l, "wgtest0", 51822, overlay, nil, nil)
+
+	if out := printed(); out != "" {
+		t.Fatalf("idempotent stop must be silent, got: %s", out)
+	}
+}
+
 // Tagged NAT rules are swept even when the config no longer mentions the
 // announcement — the stop process reads the live ruleset, not the config.
 func TestCleanupFirewallSweepsTaggedNAT(t *testing.T) {

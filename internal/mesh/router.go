@@ -474,21 +474,41 @@ func ifnameBytes(name string) []byte {
 // Intended for `meshd stop`, which runs without the daemon's in-memory
 // tracking — removal is driven by the resolved config plus the userdata
 // tag. Best-effort: absent rules and unreachable tools are skipped.
+// delIPTRule deletes an iptables rule by full spec. Idempotent by design: a
+// missing rule is already-clean and stays silent; a rule that still exists
+// after a failed delete is the only case worth warning about.
+func delIPTRule(log *log.Logger, args ...string) {
+	if _, err := exec.Command(iptablesBin, args...).CombinedOutput(); err == nil {
+		if log != nil {
+			log.Printf("router cleanup: removed iptables %s", strings.Join(args, " "))
+		}
+		return
+	}
+	probe := make([]string, len(args))
+	copy(probe, args)
+	for i, a := range probe {
+		if a == "-D" {
+			probe[i] = "-C"
+			break
+		}
+	}
+	if _, err := exec.Command(iptablesBin, probe...).CombinedOutput(); err != nil {
+		return // rule absent: already clean
+	}
+	if log != nil {
+		log.Printf("router cleanup: iptables %s: rule still present after delete", strings.Join(args, " "))
+	}
+}
+
 func CleanupFirewall(log *log.Logger, iface string, port int, overlay *net.IPNet, announce []net.IPNet, spokeIPs []net.IP) {
 	// Transport-port accepts, both families.
 	for _, fam := range []string{iptablesBin, ip6tablesBin} {
-		args := []string{"-D", "INPUT", "-p", "udp", "--dport", fmt.Sprintf("%d", port), "-j", "ACCEPT"}
-		if out, err := exec.Command(fam, args...).CombinedOutput(); err != nil && log != nil {
-			log.Printf("router cleanup: %s %s: %v (%s)", fam, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
-		}
+		delIPTRule(log, fam, "-D", "INPUT", "-p", "udp", "--dport", fmt.Sprintf("%d", port), "-j", "ACCEPT")
 	}
 	// Per-spoke masquerades.
 	for _, ip := range spokeIPs {
 		if ip4 := ip.To4(); ip4 != nil {
-			args := []string{"-t", "nat", "-D", "POSTROUTING", "-s", ip4.String() + "/32", "-o", iface, "-m", "comment", "--comment", iptComment, "-j", "MASQUERADE"}
-			if _, err := exec.Command(iptablesBin, args...).CombinedOutput(); err != nil && log != nil {
-				log.Printf("router cleanup: iptables %s: %v", strings.Join(args, " "), err)
-			}
+			delIPTRule(log, iptablesBin, "-t", "nat", "-D", "POSTROUTING", "-s", ip4.String()+"/32", "-o", iface, "-m", "comment", "--comment", iptComment, "-j", "MASQUERADE")
 		}
 	}
 	// Announce masquerades.
@@ -497,10 +517,7 @@ func CleanupFirewall(log *log.Logger, iface string, port int, overlay *net.IPNet
 			if sub.IP.To4() == nil {
 				continue
 			}
-			args := []string{"-t", "nat", "-D", "POSTROUTING", "-s", overlay.String(), "-d", sub.String(), "-m", "comment", "--comment", iptComment, "-j", "MASQUERADE"}
-			if _, err := exec.Command(iptablesBin, args...).CombinedOutput(); err != nil && log != nil {
-				log.Printf("router cleanup: iptables %s: %v", strings.Join(args, " "), err)
-			}
+			delIPTRule(log, iptablesBin, "-t", "nat", "-D", "POSTROUTING", "-s", overlay.String(), "-d", sub.String(), "-m", "comment", "--comment", iptComment, "-j", "MASQUERADE")
 		}
 	}
 	// Tagged NAT rules (announce/spoke masquerades carry an iptables
@@ -516,10 +533,8 @@ func CleanupFirewall(log *log.Logger, iface string, port int, overlay *net.IPNet
 			if !strings.HasPrefix(line, "-A POSTROUTING") || !strings.Contains(line, iptComment) {
 				continue
 			}
-			args := append([]string{"-t", "nat"}, strings.Fields(strings.Replace(line, "-A POSTROUTING", "-D POSTROUTING", 1))...)
-			if _, err := exec.Command(iptablesBin, args...).CombinedOutput(); err != nil && log != nil {
-				log.Printf("router cleanup: iptables %s: %v", strings.Join(args, " "), err)
-			}
+			delArgs := append([]string{iptablesBin, "-t", "nat"}, strings.Fields(strings.Replace(line, "-A POSTROUTING", "-D POSTROUTING", 1))...)
+			delIPTRule(log, delArgs...)
 		}
 	}
 	// Tagged self-heal rules across every nft chain (input + forward, both
