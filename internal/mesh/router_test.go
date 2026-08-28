@@ -378,12 +378,50 @@ func TestCleanupFirewallRemovesAllTraces(t *testing.T) {
 	calls := string(b)
 	for _, want := range []string{
 		"-D INPUT -p udp --dport 51822 -j ACCEPT",
-		"-D POSTROUTING -s 10.99.9.12/32 -o wgtest0 -j MASQUERADE",
-		"-D POSTROUTING -s 10.99.0.0/16 -d 192.168.1.0/24 -j MASQUERADE",
+		"-D POSTROUTING -s 10.99.9.12/32 -o wgtest0 -m comment --comment routewire-meshd -j MASQUERADE",
+		"-D POSTROUTING -s 10.99.0.0/16 -d 192.168.1.0/24 -m comment --comment routewire-meshd -j MASQUERADE",
 	} {
 		if !strings.Contains(calls, want) {
 			t.Fatalf("cleanup must remove %q, calls:\n%s", want, calls)
 		}
+	}
+}
+
+// Tagged NAT rules are swept even when the config no longer mentions the
+// announcement — the stop process reads the live ruleset, not the config.
+func TestCleanupFirewallSweepsTaggedNAT(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "calls")
+	dumpFile := filepath.Join(dir, "dump")
+	dump := `*nat
+-A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
+-A POSTROUTING -s 10.99.0.0/16 -d 192.168.1.0/24 -m comment --comment routewire-meshd -j MASQUERADE
+COMMIT`
+	// iptables-save serves the dump; iptables/ip6tables log deletes and pass
+	// the -D probes.
+	write := func(name, content string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("dump", dump)
+	write(iptablesBin, "#!/bin/sh\necho \"$@\" >> "+logFile+"\nexit 0\n")
+	write(ip6tablesBin, "#!/bin/sh\necho \"$@\" >> "+logFile+"\nexit 0\n")
+	write("iptables-save", "#!/bin/sh\n[ \"$1\" = \"-t\" ] && [ \"$2\" = \"nat\" ] && /bin/cat "+dumpFile+"\nexit 0\n")
+	write("ip6tables-save", "#!/bin/sh\nexit 0\n")
+	t.Setenv("PATH", dir)
+	l, _ := captureLog(t)
+
+	_, lan, _ := net.ParseCIDR("192.168.1.0/24")
+	CleanupFirewall(l, "wgtest0", 51822, nil, []net.IPNet{*lan}, nil)
+
+	b, _ := os.ReadFile(logFile)
+	calls := string(b)
+	if !strings.Contains(calls, "-D POSTROUTING -s 10.99.0.0/16 -d 192.168.1.0/24 -m comment --comment routewire-meshd -j MASQUERADE") {
+		t.Fatalf("tagged NAT rule must be swept by comment, calls:\n%s", calls)
+	}
+	if strings.Contains(calls, "172.17.0.0/16") {
+		t.Fatalf("untagged foreign masquerade must be left alone, calls:\n%s", calls)
 	}
 }
 

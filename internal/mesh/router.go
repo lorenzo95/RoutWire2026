@@ -24,6 +24,11 @@ var ErrNoIptables = errors.New("iptables executable not found")
 // see why they exist and Close can find them again.
 const nftComment = "routewire-meshd"
 
+// iptComment is the iptables comment marking rules meshd owns (the v4
+// analog of the nft userdata tag) so stop-cleanup can find them even when
+// the config no longer mentions the announcement.
+const iptComment = "routewire-meshd"
+
 // Router integrates the daemon with kernel routing + firewall state that a
 // mesh node needs beyond the WireGuard interface itself:
 //
@@ -480,7 +485,7 @@ func CleanupFirewall(log *log.Logger, iface string, port int, overlay *net.IPNet
 	// Per-spoke masquerades.
 	for _, ip := range spokeIPs {
 		if ip4 := ip.To4(); ip4 != nil {
-			args := []string{"-t", "nat", "-D", "POSTROUTING", "-s", ip4.String() + "/32", "-o", iface, "-j", "MASQUERADE"}
+			args := []string{"-t", "nat", "-D", "POSTROUTING", "-s", ip4.String() + "/32", "-o", iface, "-m", "comment", "--comment", iptComment, "-j", "MASQUERADE"}
 			if _, err := exec.Command(iptablesBin, args...).CombinedOutput(); err != nil && log != nil {
 				log.Printf("router cleanup: iptables %s: %v", strings.Join(args, " "), err)
 			}
@@ -492,7 +497,26 @@ func CleanupFirewall(log *log.Logger, iface string, port int, overlay *net.IPNet
 			if sub.IP.To4() == nil {
 				continue
 			}
-			args := []string{"-t", "nat", "-D", "POSTROUTING", "-s", overlay.String(), "-d", sub.String(), "-j", "MASQUERADE"}
+			args := []string{"-t", "nat", "-D", "POSTROUTING", "-s", overlay.String(), "-d", sub.String(), "-m", "comment", "--comment", iptComment, "-j", "MASQUERADE"}
+			if _, err := exec.Command(iptablesBin, args...).CombinedOutput(); err != nil && log != nil {
+				log.Printf("router cleanup: iptables %s: %v", strings.Join(args, " "), err)
+			}
+		}
+	}
+	// Tagged NAT rules (announce/spoke masquerades carry an iptables
+	// comment): swept so rules whose announcement was already removed from
+	// the config are still cleaned up at stop.
+	for _, tool := range []string{"iptables-save", "ip6tables-save"} {
+		out, err := exec.Command(tool, "-t", "nat").CombinedOutput()
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "-A POSTROUTING") || !strings.Contains(line, iptComment) {
+				continue
+			}
+			args := append([]string{"-t", "nat"}, strings.Fields(strings.Replace(line, "-A POSTROUTING", "-D POSTROUTING", 1))...)
 			if _, err := exec.Command(iptablesBin, args...).CombinedOutput(); err != nil && log != nil {
 				log.Printf("router cleanup: iptables %s: %v", strings.Join(args, " "), err)
 			}
@@ -549,7 +573,7 @@ func (r *linuxRouter) AddSource(spoke net.IP) error {
 	if r.added[src] {
 		return nil
 	}
-	if err := r.run("nat", "-I", "POSTROUTING", "1", "-s", src, "-o", r.iface, "-j", "MASQUERADE"); err != nil {
+	if err := r.run("nat", "-I", "POSTROUTING", "1", "-s", src, "-o", r.iface, "-m", "comment", "--comment", iptComment, "-j", "MASQUERADE"); err != nil {
 		return err
 	}
 	r.added[src] = true
@@ -580,7 +604,7 @@ func (r *linuxRouter) AnnounceNAT(overlay *net.IPNet, subnets []net.IPNet) error
 			continue
 		}
 		src := strings.SplitN(key, "|", 2)[0]
-		if err := r.run("nat", "-D", "POSTROUTING", "-s", src, "-d", dst, "-j", "MASQUERADE"); err != nil && r.log != nil {
+		if err := r.run("nat", "-D", "POSTROUTING", "-s", src, "-d", dst, "-m", "comment", "--comment", iptComment, "-j", "MASQUERADE"); err != nil && r.log != nil {
 			r.log.Printf("router: remove announce nat %s: %v", key, err)
 		}
 		delete(r.announceNAT, key)
@@ -591,7 +615,7 @@ func (r *linuxRouter) AnnounceNAT(overlay *net.IPNet, subnets []net.IPNet) error
 			continue
 		}
 		src := strings.SplitN(key, "|", 2)[0]
-		if err := r.run("nat", "-I", "POSTROUTING", "1", "-s", src, "-d", dst, "-j", "MASQUERADE"); err != nil {
+		if err := r.run("nat", "-I", "POSTROUTING", "1", "-s", src, "-d", dst, "-m", "comment", "--comment", iptComment, "-j", "MASQUERADE"); err != nil {
 			if r.log != nil {
 				r.log.Printf("router: announce nat %s: %v", key, err)
 			}
@@ -614,7 +638,7 @@ func (r *linuxRouter) RemoveSource(spoke net.IP) error {
 	if !r.added[src] {
 		return nil
 	}
-	if err := r.run("nat", "-D", "POSTROUTING", "-s", src, "-o", r.iface, "-j", "MASQUERADE"); err != nil {
+	if err := r.run("nat", "-D", "POSTROUTING", "-s", src, "-o", r.iface, "-m", "comment", "--comment", iptComment, "-j", "MASQUERADE"); err != nil {
 		return err
 	}
 	delete(r.added, src)
@@ -627,13 +651,13 @@ func (r *linuxRouter) Close() error {
 	var first error
 	for key, dst := range r.announceNAT {
 		src := strings.SplitN(key, "|", 2)[0]
-		if err := r.run("nat", "-D", "POSTROUTING", "-s", src, "-d", dst, "-j", "MASQUERADE"); err != nil && first == nil {
+		if err := r.run("nat", "-D", "POSTROUTING", "-s", src, "-d", dst, "-m", "comment", "--comment", iptComment, "-j", "MASQUERADE"); err != nil && first == nil {
 			first = err
 		}
 	}
 	r.announceNAT = make(map[string]string)
 	for src := range r.added {
-		if err := r.run("nat", "-D", "POSTROUTING", "-s", src, "-o", r.iface, "-j", "MASQUERADE"); err != nil && first == nil {
+		if err := r.run("nat", "-D", "POSTROUTING", "-s", src, "-o", r.iface, "-m", "comment", "--comment", iptComment, "-j", "MASQUERADE"); err != nil && first == nil {
 			first = err
 		}
 	}
