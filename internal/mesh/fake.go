@@ -20,8 +20,11 @@ type FakeDevice struct {
 	History   [][]PeerDesire
 	Routes    []net.IPNet
 	Reachable func(ep *net.UDPAddr) bool
-	hs        map[wgtypes.Key]time.Time
-	lastEP    map[wgtypes.Key]*net.UDPAddr
+	// ApplyErr, when set, is returned by every Apply call (e.g. a wrapped
+	// ErrDeviceGone to simulate the interface being deleted).
+	ApplyErr error
+	hs       map[wgtypes.Key]time.Time
+	lastEP   map[wgtypes.Key]*net.UDPAddr
 	// observed, when set, is the endpoint Endpoint() reports — simulating the
 	// roamed/peer-reflexive address WireGuard tracks from inbound traffic.
 	observed map[wgtypes.Key]*net.UDPAddr
@@ -44,6 +47,9 @@ func (f *FakeDevice) Setup(key wgtypes.Key, _, _ int, _, _ *net.IPNet) error {
 }
 
 func (f *FakeDevice) Apply(peers []PeerDesire) error {
+	if f.ApplyErr != nil {
+		return f.ApplyErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	cp := append([]PeerDesire(nil), peers...)

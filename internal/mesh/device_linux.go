@@ -94,7 +94,10 @@ func (ld *LinuxDevice) Setup(key wgtypes.Key, listenPort, mtu int, addr *net.IPN
 func (ld *LinuxDevice) Apply(peers []PeerDesire) error {
 	dev, err := ld.cl.Device(ld.iface)
 	if err != nil {
-		return err
+		// The interface was deleted out from under us (meshd -stop against a
+		// live daemon, operator cleanup). Report it as the sentinel so the
+		// daemon shuts down instead of fighting to re-create state.
+		return fmt.Errorf("apply: %w: %w", ErrDeviceGone, err)
 	}
 	current := make(map[wgtypes.Key]bool, len(dev.Peers))
 	for _, p := range dev.Peers {

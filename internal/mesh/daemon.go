@@ -1,6 +1,7 @@
 package mesh
 
 import (
+	"errors"
 	"context"
 	"fmt"
 	"log"
@@ -151,6 +152,14 @@ func (dm *Daemon) Run(ctx context.Context) {
 		case <-ticker.C:
 			if err := dm.Tick(ctx); err != nil {
 				dm.log.Printf("tick: %v", err)
+				// The interface was deleted out from under us (meshd -stop
+				// against a live daemon, operator cleanup): yield instead of
+				// error-looping or re-asserting firewall state. Stop means
+				// stop — main's cleanup runs when Run returns.
+				if errors.Is(err, ErrDeviceGone) {
+					dm.log.Printf("interface removed — stopping (a running -stop takes precedence)")
+					return
+				}
 			}
 		}
 	}

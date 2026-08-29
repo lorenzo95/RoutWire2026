@@ -1,11 +1,18 @@
 package mesh
 
 import (
+	"errors"
 	"net"
 	"time"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
+
+// ErrDeviceGone is returned when the WireGuard interface this node manages
+// has been removed (meshd -stop against a live daemon, operator cleanup).
+// The daemon treats it as a shutdown signal instead of error-looping: the
+// operator said stop, and the daemon must not fight to re-create state.
+var ErrDeviceGone = errors.New("wireguard interface is gone")
 
 // PeerDesire is one node's complete intended WireGuard peer state. AllowedIPs
 // always includes the peer's overlay /32 plus whatever subnets it announces.

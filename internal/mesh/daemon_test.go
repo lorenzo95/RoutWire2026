@@ -1,6 +1,7 @@
 package mesh
 
 import (
+	"errors"
 	"context"
 	"fmt"
 	"io"
@@ -492,5 +493,32 @@ func TestOrderedForGatesPrivateObserved(t *testing.T) {
 	order = alpha.orderedFor(betaPub, mine, shared)
 	if len(order) == 0 || order[0].Type != CandPRFLX || order[0].Addr != privAddr {
 		t.Fatalf("private observed endpoint must lead the race on a shared edge, got %+v", order)
+	}
+}
+
+// meshd -stop against a live daemon deletes the interface; the daemon must
+// yield (exit) instead of error-looping or re-asserting firewall state —
+// stop means stop.
+func TestRunExitsWhenDeviceGone(t *testing.T) {
+	store := engine.NewReliable(engine.NewMockStore(10*time.Minute, time.Now))
+	n := &recRouter{}
+	dev := NewFakeDevice()
+	dev.ApplyErr = fmt.Errorf("apply: %w: %w", ErrDeviceGone, errors.New("link not found"))
+	dm, _ := newTestDaemon(t, "alpha", store, dev)
+	dm.router = n
+	dm.cfg.Poll = 5 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		dm.Run(ctx)
+	}()
+	select {
+	case <-done:
+		// Run returned: the daemon yielded to the teardown. ✓
+	case <-time.After(1 * time.Second):
+		t.Fatal("Run must exit when the device is gone (stop means stop)")
 	}
 }
