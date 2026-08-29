@@ -462,9 +462,7 @@ func (r *linuxRouter) applyForwardSelfHeal() {
 			}
 			continue
 		}
-		r.mu.Lock()
 		r.taggedChains = append(r.taggedChains, chain)
-		r.mu.Unlock()
 		inserted++
 		if r.log != nil {
 			r.log.Printf("router: opened forwarding for %q in firewall %q chain %q (its drop policy would have blocked it)", r.iface, chain.Table.Name, chain.Name)
@@ -575,16 +573,14 @@ func ifnameBytes(name string) []byte {
 // Intended for `meshd stop`, which runs without the daemon's in-memory
 // tracking — removal is driven by the resolved config plus the userdata
 // tag. Best-effort: absent rules and unreachable tools are skipped.
-// delIPTRule deletes an iptables rule by full spec. Idempotent by design: a
-// missing rule is already-clean and stays silent; a rule that still exists
-// after a failed delete is the only case worth warning about.
-func delIPTRule(log *log.Logger, args ...string) {
-	if _, err := exec.Command(iptablesBin, args...).CombinedOutput(); err == nil {
-		if log != nil {
-			log.Printf("router cleanup: removed iptables %s", strings.Join(args, " "))
-		}
-		return
-	}
+// delIPTRule deletes an iptables rule by full spec. Idempotent by design:
+// the -C probe distinguishes "already clean" (silent skip) from "rule exists
+// but delete failed" (the only case worth warning about).
+// delIPTRule deletes one iptables rule: bin selects the flavor
+// (iptables/ip6tables), args are the rule spec starting with -D. Idempotent
+// by design: the -C probe distinguishes "already clean" (silent skip) from
+// "rule exists but delete failed" (the only case worth warning about).
+func delIPTRule(log *log.Logger, bin string, args ...string) {
 	probe := make([]string, len(args))
 	copy(probe, args)
 	for i, a := range probe {
@@ -593,11 +589,13 @@ func delIPTRule(log *log.Logger, args ...string) {
 			break
 		}
 	}
-	if _, err := exec.Command(iptablesBin, probe...).CombinedOutput(); err != nil {
+	if _, err := exec.Command(bin, probe...).CombinedOutput(); err != nil {
 		return // rule absent: already clean
+	} else if log != nil {
+		log.Printf("router cleanup: removing %s %s", bin, strings.Join(args, " "))
 	}
-	if log != nil {
-		log.Printf("router cleanup: iptables %s: rule still present after delete", strings.Join(args, " "))
+	if _, err := exec.Command(bin, args...).CombinedOutput(); err != nil && log != nil {
+		log.Printf("router cleanup: %s %s: FAILED: %v", bin, strings.Join(args, " "), err)
 	}
 }
 
@@ -634,8 +632,7 @@ func CleanupFirewall(log *log.Logger, iface string, port int, overlay *net.IPNet
 			if !strings.HasPrefix(line, "-A POSTROUTING") || !strings.Contains(line, iptComment) {
 				continue
 			}
-			delArgs := append([]string{iptablesBin, "-t", "nat"}, strings.Fields(strings.Replace(line, "-A POSTROUTING", "-D POSTROUTING", 1))...)
-			delIPTRule(log, delArgs...)
+			delIPTRule(log, iptablesBin, append([]string{"-t", "nat"}, strings.Fields(strings.Replace(line, "-A POSTROUTING", "-D POSTROUTING", 1))...)...)
 		}
 	}
 	// Tagged self-heal rules across every nft chain (input + forward, both
@@ -765,6 +762,9 @@ func (r *linuxRouter) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var first error
+	// All deletes here are idempotent: a rule that is already gone is
+	// already-clean, not an error (a live Close can race an operator's
+	// manual removal, and test routers may never have opened the port).
 	for key, dst := range r.announceNAT {
 		src := strings.SplitN(key, "|", 2)[0]
 		if err := r.run("nat", "-D", "POSTROUTING", "-s", src, "-d", dst, "-m", "comment", "--comment", iptComment, "-j", "MASQUERADE"); err != nil && first == nil {
@@ -778,13 +778,9 @@ func (r *linuxRouter) Close() error {
 		}
 	}
 	r.added = make(map[string]bool)
-	if err := r.run("filter", "-D", "INPUT", "-p", "udp", "--dport", fmt.Sprintf("%d", r.port), "-j", "ACCEPT"); err != nil && first == nil {
-		first = err
-	}
+	delIPTRule(r.log, iptablesBin, "-D", "INPUT", "-p", "udp", "--dport", fmt.Sprintf("%d", r.port), "-j", "ACCEPT")
 	if r.hasIP6 {
-		if err := r.run6("filter", "-D", "INPUT", "-p", "udp", "--dport", fmt.Sprintf("%d", r.port), "-j", "ACCEPT"); err != nil && first == nil {
-			first = err
-		}
+		delIPTRule(r.log, ip6tablesBin, "-D", "INPUT", "-p", "udp", "--dport", fmt.Sprintf("%d", r.port), "-j", "ACCEPT")
 	}
 	if len(r.taggedChains) > 0 {
 		if conn, err := nftables.New(); err == nil {

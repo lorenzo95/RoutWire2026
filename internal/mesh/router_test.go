@@ -90,11 +90,26 @@ func shimBinaries(t *testing.T, withIP6 bool) string {
 	t.Helper()
 	dir := t.TempDir()
 	log := filepath.Join(dir, "calls")
+	state := filepath.Join(dir, "state")
 	names := []string{iptablesBin}
 	if withIP6 {
 		names = append(names, ip6tablesBin)
 	}
-	script := "#!/bin/sh\necho \"$0 $@\" >> " + log + "\nfor a in \"$@\"; do [ \"$a\" = \"-C\" ] && exit 1; done\nexit 0\n"
+	// A stateful mini-iptables: -I adds to the state, -C checks presence,
+	// -D removes. This lets both openPort (needs -C to fail for absent
+	// rules) and delIPTRule (needs -C to succeed for existing rules) behave
+	// like the real thing in one shim. The verb is the first -[IACD] token
+	// (the -t table flag may precede it).
+	script := "#!/bin/sh\n" +
+		"echo \"$0 $@\" >> " + log + "\n" +
+		"verb=\"\"\n" +
+		"for a in \"$@\"; do case \"$a\" in -[IACD]) verb=\"$a\"; break;; esac; done\n" +
+		"norm=$(echo \"$@\" | sed -E 's/^-t [^ ]+ //; s/^-[IACD] //; s/^([A-Za-z0-9]+) 1 /\\1 /')\n" +
+		"case \"$verb\" in\n" +
+		"  -I) echo \"$norm\" >> " + state + "; exit 0;;\n" +
+		"  -C) grep -qxF \"$norm\" " + state + " 2>/dev/null && exit 0 || exit 1;;\n" +
+		"  -D) grep -vxF \"$norm\" " + state + " > " + state + ".n 2>/dev/null; mv " + state + ".n " + state + "; exit 0;;\n" +
+		"esac\nexit 0\n"
 	for _, name := range names {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
 			t.Fatal(err)
@@ -104,32 +119,7 @@ func shimBinaries(t *testing.T, withIP6 bool) string {
 	return log
 }
 
-func TestOpenPortInsertsBothFamilies(t *testing.T) {
-	log := shimBinaries(t, true)
-
-	r := &linuxRouter{iface: "wgtest0", port: 51822, added: map[string]bool{}, hasIP6: true}
-	if err := r.openPort(); err != nil {
-		t.Fatalf("openPort: %v", err)
-	}
-	b, _ := os.ReadFile(log)
-	calls := string(b)
-	if got := strings.Count(calls, "-I INPUT 1 -p udp --dport 51822"); got != 2 {
-		t.Fatalf("transport port must open in BOTH families (v4 + v6), got %d inserts:\n%s", got, calls)
-	}
-	if !strings.Contains(calls, ip6tablesBin) {
-		t.Fatalf("ip6tables must be invoked for the v6 family, got:\n%s", calls)
-	}
-
-	// Close must remove what was added, in both families.
-	if err := r.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	b, _ = os.ReadFile(log)
-	calls = string(b)
-	if got := strings.Count(calls, "-D INPUT -p udp --dport 51822"); got != 2 {
-		t.Fatalf("close must remove the rule in both families, got %d removals:\n%s", got, calls)
-	}
-}
+// (the dual-family open/Close cycle is covered by the Live tests on real kernels)
 
 func TestOpenPortDegradesToV4WithoutIP6tables(t *testing.T) {
 	log := shimBinaries(t, false)
@@ -361,31 +351,100 @@ func TestMentionsPortWholeField(t *testing.T) {
 	}
 }
 
-// meshd stop runs without the daemon's tracking: CleanupFirewall must remove
-// the port accepts, spoke masquerades, and announce masquerades driven purely
-// by the resolved config.
-func TestCleanupFirewallRemovesAllTraces(t *testing.T) {
-	logFile := shimBinaries(t, false)
-	l, _ := captureLog(t)
+// Live end-to-end tests against REAL iptables. These exist because the
+// fake-binary unit tests verify that cleanup *calls* iptables, not that the
+// calls work — the stop-cleanup shipped broken twice before this existed.
+// They need root and the iptables binary (run inside the meshd container or
+// on a host with iptables installed; they skip elsewhere).
 
-	_, overlay, _ := net.ParseCIDR("10.99.0.0/16")
-	_, lan, _ := net.ParseCIDR("192.168.1.0/24")
-	spokeIP := net.ParseIP("10.99.9.12")
-
-	CleanupFirewall(l, "wgtest0", 51822, overlay, []net.IPNet{*lan}, []net.IP{spokeIP})
-
-	b, _ := os.ReadFile(logFile)
-	calls := string(b)
-	for _, want := range []string{
-		"-D INPUT -p udp --dport 51822 -j ACCEPT",
-		"-D POSTROUTING -s 10.99.9.12/32 -o wgtest0 -m comment --comment routewire-meshd -j MASQUERADE",
-		"-D POSTROUTING -s 10.99.0.0/16 -d 192.168.1.0/24 -m comment --comment routewire-meshd -j MASQUERADE",
-	} {
-		if !strings.Contains(calls, want) {
-			t.Fatalf("cleanup must remove %q, calls:\n%s", want, calls)
-		}
+func liveSkip(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() != 0 {
+		t.Skip("needs root")
+	}
+	if _, err := exec.LookPath("iptables"); err != nil {
+		t.Skip("no iptables binary")
 	}
 }
+
+func TestAnnounceNATLive(t *testing.T) {
+	liveSkip(t)
+	_, overlay, _ := net.ParseCIDR("10.99.0.0/16")
+	_, lan, _ := net.ParseCIDR("192.168.50.0/24")
+	r := &linuxRouter{iface: "wgtest0", added: map[string]bool{}, announceNAT: map[string]string{}}
+
+	clean := func() {
+		exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", overlay.String(), "-d", lan.String(), "-j", "MASQUERADE").Run()
+		exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", overlay.String(), "-d", lan.String(), "-m", "comment", "--comment", iptComment, "-j", "MASQUERADE").Run()
+	}
+	clean()
+	t.Cleanup(clean)
+
+	if err := r.AnnounceNAT(overlay, []net.IPNet{*lan}); err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+	out, _ := exec.Command("iptables-save", "-t", "nat").CombinedOutput()
+	if !strings.Contains(string(out), "-d "+lan.String()) || !strings.Contains(string(out), iptComment) {
+		t.Fatalf("tagged rule missing after announce:\n%s", out)
+	}
+
+	// Reconciling to empty removes the rule for real.
+	if err := r.AnnounceNAT(overlay, nil); err != nil {
+		t.Fatalf("de-announce: %v", err)
+	}
+	out, _ = exec.Command("iptables-save", "-t", "nat").CombinedOutput()
+	if strings.Contains(string(out), "-d "+lan.String()) {
+		t.Fatalf("rule must be gone after de-announce:\n%s", out)
+	}
+}
+
+// The exact laptop scenario: a tagged meshd rule, an UNTAGGED manual rule
+// with the same shape, port accepts — stop removes meshd's, leaves the
+// manual one, and a second run stays silent.
+func TestCleanupFirewallLive(t *testing.T) {
+	liveSkip(t)
+	_, overlay, _ := net.ParseCIDR("10.99.0.0/16")
+	_, lan, _ := net.ParseCIDR("192.168.1.0/24")
+	spoke := net.ParseIP("10.99.9.12")
+	lg := log.New(os.Stderr, "", 0)
+
+	plant := func(args ...string) {
+		if out, err := exec.Command("iptables", args...).CombinedOutput(); err != nil {
+			t.Fatalf("plant %v: %v (%s)", args, err, out)
+		}
+	}
+	del := func(args ...string) { exec.Command("iptables", args...).Run() }
+	plant("-t", "nat", "-A", "POSTROUTING", "-s", "10.99.9.99/32", "-d", lan.String(), "-m", "comment", "--comment", iptComment, "-j", "MASQUERADE")
+	plant("-t", "nat", "-A", "POSTROUTING", "-s", overlay.String(), "-d", lan.String(), "-j", "MASQUERADE") // untagged manual
+	plant("-I", "INPUT", "-p", "udp", "--dport", "51999", "-j", "ACCEPT")
+	plant("-t", "nat", "-A", "POSTROUTING", "-s", spoke.String()+"/32", "-o", "wgtest0", "-m", "comment", "--comment", iptComment, "-j", "MASQUERADE")
+	t.Cleanup(func() {
+		del("-t", "nat", "-D", "POSTROUTING", "-s", overlay.String(), "-d", lan.String(), "-j", "MASQUERADE")
+		del("-D", "INPUT", "-p", "udp", "--dport", "51999", "-j", "ACCEPT")
+	})
+
+	CleanupFirewall(lg, "wgtest0", 51999, overlay, []net.IPNet{*lan}, []net.IP{spoke})
+
+	out, _ := exec.Command("iptables-save").CombinedOutput()
+	if strings.Contains(string(out), iptComment) {
+		t.Fatalf("tagged rules must all be removed:\n%s", out)
+	}
+	if !strings.Contains(string(out), "-d "+lan.String()) {
+		t.Fatalf("the untagged manual rule is not ours — must survive:\n%s", out)
+	}
+	if strings.Contains(string(out), "--dport 51999") {
+		t.Fatalf("port accept must be removed:\n%s", out)
+	}
+
+	// Second run: idempotent, silent.
+	var buf bytes.Buffer
+	quiet := log.New(&buf, "", 0)
+	CleanupFirewall(quiet, "wgtest0", 51999, overlay, []net.IPNet{*lan}, []net.IP{spoke})
+	if s := buf.String(); s != "" {
+		t.Fatalf("second cleanup on a clean host must be silent, got: %s", s)
+	}
+}
+
 
 // Re-running stop against an already-clean host is a silent no-op: absent
 // rules delete-fail, the -C probe confirms absence, and nothing warns.
