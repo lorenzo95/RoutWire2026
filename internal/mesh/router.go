@@ -50,6 +50,11 @@ type Router interface {
 	// the overlay). Pass the current announcements every tick; rules for
 	// dropped announcements are removed.
 	AnnounceNAT(overlay *net.IPNet, subnets []net.IPNet) error
+	// EnsurePort re-asserts the INPUT accept for the transport port if the
+	// host's firewall dropped it. Called every tick: hostile or self-managed
+	// firewalls on the same host can wipe runtime rules, and new handshakes
+	// die in the gap until the next daemon restart.
+	EnsurePort() error
 	// Close removes firewall + masquerade rules and restores forwarding.
 	Close() error
 }
@@ -61,6 +66,7 @@ func (noopRouter) Forwarding() error                         { return nil }
 func (noopRouter) AddSource(net.IP) error                    { return nil }
 func (noopRouter) RemoveSource(net.IP) error                 { return nil }
 func (noopRouter) AnnounceNAT(*net.IPNet, []net.IPNet) error { return nil }
+func (noopRouter) EnsurePort() error                         { return nil }
 func (noopRouter) Close() error                              { return nil }
 
 // Package-level binary names so tests can shim them via PATH.
@@ -667,6 +673,33 @@ func CleanupFirewall(log *log.Logger, iface string, port int, overlay *net.IPNet
 	if flush {
 		_ = conn.Flush()
 	}
+}
+
+// EnsurePort re-asserts the transport-port INPUT accepts every tick. The
+// rules this guards live in foreign chains: firewalls and firewall managers
+// on the same host (Pangolin reloads, crowdsec rebuilds, operator edits) can
+// wipe them at any moment, and new handshakes die in the gap. Cheap: two -C
+// probes per family, inserting only when a probe says the rule is gone.
+func (r *linuxRouter) EnsurePort() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, fam := range []string{iptablesBin, ip6tablesBin} {
+		probe := []string{"-C", "INPUT", "-p", "udp", "--dport", fmt.Sprintf("%d", r.port), "-j", "ACCEPT"}
+		if _, err := exec.Command(fam, probe...).CombinedOutput(); err != nil {
+			// absent: re-insert.
+			insert := []string{"-I", "INPUT", "1", "-p", "udp", "--dport", fmt.Sprintf("%d", r.port), "-j", "ACCEPT"}
+			if out, err := exec.Command(fam, insert...).CombinedOutput(); err != nil {
+				if r.log != nil {
+					r.log.Printf("router: re-open udp/%d via %s failed: %v (%s)", r.port, fam, err, strings.TrimSpace(string(out)))
+				}
+				continue
+			}
+			if r.log != nil {
+				r.log.Printf("router: re-opened udp/%d via %s (host firewall had dropped the accept)", r.port, fam)
+			}
+		}
+	}
+	return nil
 }
 
 func (r *linuxRouter) AddSource(spoke net.IP) error {

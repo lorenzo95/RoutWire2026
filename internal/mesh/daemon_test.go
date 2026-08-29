@@ -171,6 +171,9 @@ func (n *recRouter) AnnounceNAT(overlay *net.IPNet, subnets []net.IPNet) error {
 	n.announce = append(n.announce, overlay.String()+" "+fmt.Sprint(subnets))
 	return nil
 }
+func (n *recRouter) EnsurePort() error {
+	return nil
+}
 func (n *recRouter) RemoveSource(ip net.IP) error {
 	n.removed = append(n.removed, ip.String())
 	return nil

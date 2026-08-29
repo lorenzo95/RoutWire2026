@@ -367,6 +367,11 @@ func (dm *Daemon) syncNat() {
 	if err := dm.router.AnnounceNAT(dm.cfg.CIDR, parseCIDRs(dm.cfg.Announce)); err != nil {
 		dm.log.Printf("router: announce nat: %v", err)
 	}
+	// The transport-port accept lives in foreign firewall chains that other
+	// tooling on the host can wipe at any time; re-assert it every tick.
+	if err := dm.router.EnsurePort(); err != nil {
+		dm.log.Printf("router: ensure port: %v", err)
+	}
 	want := make(map[string]net.IP)
 	for name := range dm.spokes {
 		if ip, err := dm.d.OverlayIP(name, dm.cfg.CIDR); err == nil {
