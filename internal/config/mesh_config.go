@@ -101,6 +101,9 @@ func mergeMeshInto(dst, src *MeshConfig) {
 	if src.DryRun {
 		dst.DryRun = true
 	}
+	if src.FirewallSelfHeal {
+		dst.FirewallSelfHeal = true
+	}
 }
 
 func flagsSet(flags map[string]string, name string) bool {

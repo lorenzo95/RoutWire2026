@@ -67,3 +67,11 @@ func TestLoadMeshConfigHandlesJSONAndYAML(t *testing.T) {
 		t.Fatalf("yaml parse wrong: %+v", yc)
 	}
 }
+
+func TestResolveMeshPropagatesFirewallSelfHeal(t *testing.T) {
+	file := &MeshConfig{FirewallSelfHeal: true}
+	got := ResolveMesh(nil, file, nil, nil)
+	if !got.FirewallSelfHeal {
+		t.Fatal("firewall_selfheal must propagate from the config file")
+	}
+}
